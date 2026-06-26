@@ -86,37 +86,49 @@ Expected response:
 
 ## Running with Docker
 
-Start the full stack:
+Build the images (optional, compose will build automatically when needed):
 
 ```bash
-docker compose up --build -d
+docker compose build
 ```
 
-Run the Celery worker and beat explicitly:
+Start all services (development / production-like):
 
 ```bash
-docker compose up --build -d db redis api celery-worker celery-beat
+docker compose up --build
 ```
 
-View logs:
-
-```bash
-docker compose logs -f celery-worker celery-beat
-```
-
-Stop everything:
+Stop and remove containers:
 
 ```bash
 docker compose down
 ```
 
-Services:
+Developer commands
+
+- Start (foreground):
+  - `docker compose up`
+- Stop: `docker compose down`
+- Restart: `docker compose restart`
+- Logs: `docker compose logs -f`
+- API shell:
+  - `docker compose exec api bash`
+- PostgreSQL shell:
+  - `docker compose exec postgres psql -U threatlens -d threatlens`
+- Worker logs:
+  - `docker compose logs -f celery-worker`
+- Beat logs:
+  - `docker compose logs -f celery-beat`
+
+Services exposed (defaults):
 
 - API: http://localhost:8000
-- PostgreSQL: localhost:5433
-- Redis: localhost:6379
-- Celery worker: background task execution
-- Celery beat: scheduled ingestion runs
+- PostgreSQL: mapped host port 5433 -> container 5432
+- Redis: mapped host port 6379 -> container 6379
+
+Notes:
+- The API container waits for Postgres and Redis to be healthy before running migrations and starting.
+- In development (ENVIRONMENT=development) Alembic migrations run automatically during container startup.
 
 ## Ingestion engine
 

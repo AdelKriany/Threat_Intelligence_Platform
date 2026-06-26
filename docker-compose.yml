@@ -1,63 +1,7 @@
 services:
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: threatlens-api
-    command: uvicorn app.main:create_app --host 0.0.0.0 --port 8000 --factory
-    environment:
-      ENVIRONMENT: development
-      SECRET_KEY: change-me-in-production
-      DATABASE_URL: postgresql+psycopg://threatlens:threatlens@db:5432/threatlens
-      REDIS_URL: redis://redis:6379/0
-      LOG_LEVEL: INFO
-    ports:
-      - "8000:8000"
-    depends_on:
-      - db
-      - redis
-    volumes:
-      - .:/app
-
-  celery-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: threatlens-celery-worker
-    command: celery -A app.workers.celery_app worker --loglevel=info
-    environment:
-      ENVIRONMENT: development
-      SECRET_KEY: change-me-in-production
-      DATABASE_URL: postgresql+psycopg://threatlens:threatlens@db:5432/threatlens
-      REDIS_URL: redis://redis:6379/0
-      LOG_LEVEL: INFO
-    depends_on:
-      - db
-      - redis
-    volumes:
-      - .:/app
-
-  celery-beat:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: threatlens-celery-beat
-    command: celery -A app.workers.celery_app beat --loglevel=info
-    environment:
-      ENVIRONMENT: development
-      SECRET_KEY: change-me-in-production
-      DATABASE_URL: postgresql+psycopg://threatlens:threatlens@db:5432/threatlens
-      REDIS_URL: redis://redis:6379/0
-      LOG_LEVEL: INFO
-    depends_on:
-      - db
-      - redis
-    volumes:
-      - .:/app
-
-  db:
+  postgres:
     image: postgres:16-alpine
-    container_name: threatlens-db
+    container_name: threatlens-postgres
     environment:
       POSTGRES_DB: threatlens
       POSTGRES_USER: threatlens
@@ -66,12 +10,106 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threatlens -d threatlens || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     container_name: threatlens-redis
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: threatlens-api
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${REDIS_URL:-redis://redis:6379/0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend:cached
+      - ./alembic:/app/alembic:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "/app/.venv/bin/python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health').status==200 else sys.exit(1)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: threatlens-celery-worker
+    command: ["/app/.venv/bin/celery", "-A", "app.workers.celery_app", "worker", "--loglevel=info"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${REDIS_URL:-redis://redis:6379/0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./backend:/app/backend:cached
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: threatlens-celery-beat
+    command: ["/app/.venv/bin/celery", "-A", "app.workers.celery_app", "beat", "--loglevel=info"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${REDIS_URL:-redis://redis:6379/0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./backend:/app/backend:cached
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:
+  redis_data:
