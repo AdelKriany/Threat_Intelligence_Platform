@@ -39,25 +39,26 @@ services:
       dockerfile: Dockerfile
     container_name: threatlens-api
     environment:
-      ENVIRONMENT: ${ENVIRONMENT:-production}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       CELERY_BROKER_URL: ${REDIS_URL:-redis://redis:6379/0}
       CELERY_RESULT_BACKEND: ${REDIS_URL:-redis://redis:6379/0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONPATH: /app/backend
     ports:
       - "8000:8000"
     volumes:
-      - ./backend:/app/backend:cached
-      - ./alembic:/app/alembic:ro
+      - ./backend:/app/backend:z
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    command: ["uvicorn", "app.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--factory"]
     healthcheck:
-      test: ["CMD-SHELL", "/app/.venv/bin/python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health').status==200 else sys.exit(1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health').status==200 else sys.exit(1)\" || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -69,22 +70,23 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: threatlens-celery-worker
-    command: ["/app/.venv/bin/celery", "-A", "app.workers.celery_app", "worker", "--loglevel=info"]
+    command: ["python", "/app/scripts/celery_wrapper.py", "-A", "app.workers.celery_app", "worker", "--loglevel=info"]
     environment:
-      ENVIRONMENT: ${ENVIRONMENT:-production}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       CELERY_BROKER_URL: ${REDIS_URL:-redis://redis:6379/0}
       CELERY_RESULT_BACKEND: ${REDIS_URL:-redis://redis:6379/0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONPATH: /app/backend
     volumes:
-      - ./backend:/app/backend:cached
+     - ./backend:/app/backend:z
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+     postgres:
+       condition: service_healthy
+     redis:
+       condition: service_healthy
     restart: unless-stopped
 
   celery-beat:
@@ -92,17 +94,16 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: threatlens-celery-beat
-    command: ["/app/.venv/bin/celery", "-A", "app.workers.celery_app", "beat", "--loglevel=info"]
+    command: ["python", "/app/scripts/celery_wrapper.py", "-A", "app.workers.celery_app", "beat", "--loglevel=info", "-s", "/tmp/celerybeat-schedule"]
     environment:
-      ENVIRONMENT: ${ENVIRONMENT:-production}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       CELERY_BROKER_URL: ${REDIS_URL:-redis://redis:6379/0}
       CELERY_RESULT_BACKEND: ${REDIS_URL:-redis://redis:6379/0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    volumes:
-      - ./backend:/app/backend:cached
+      PYTHONPATH: /app/backend
     depends_on:
       postgres:
         condition: service_healthy

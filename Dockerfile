@@ -6,7 +6,9 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY backend backend
 # Create the virtualenv and install dependencies (production: no dev extras)
-RUN uv lock --force && uv sync --frozen --no-dev
+RUN uv lock && uv sync --frozen --no-dev && \
+    # Install the project in editable mode so app module is properly discoverable
+    . /app/.venv/bin/activate && pip install -e .
 
 # Runtime stage: small base image
 FROM python:3.12-slim-bookworm AS runtime
@@ -20,9 +22,14 @@ COPY --from=builder /app/.venv /app/.venv
 # Copy application code
 COPY backend backend
 COPY scripts scripts
+COPY alembic.ini alembic.ini
+COPY alembic alembic
 
-# Make entrypoint executable
-RUN chmod +x /app/scripts/docker-entrypoint.sh
+# Make entrypoint executable and ensure scripts are executable
+RUN chmod +x /app/scripts/docker-entrypoint.sh /app/scripts/celery_wrapper.py && \
+    # Fix permissions so non-root user can access and write to alembic directory (for migrations)
+    chown -R app:app /app && \
+    chmod -R u+w /app/alembic
 
 # Ensure venv binaries are on PATH
 ENV PATH="/app/.venv/bin:$PATH" \
@@ -30,8 +37,6 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Fix permissions so non-root user can read files
-RUN chown -R app:app /app
 USER app
 
 EXPOSE 8000

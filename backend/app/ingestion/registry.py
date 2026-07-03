@@ -61,7 +61,7 @@ class FeedRegistry:
             ),
             FeedSource(
                 name="Cisco Talos",
-                url="https://talosintelligence.com/feed2.xml",
+                url="https://talosintelligence.com/rss.xml",
                 poll_interval_minutes=60,
             ),
         ]
