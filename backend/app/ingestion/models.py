@@ -6,6 +6,8 @@ from typing import Any
 
 from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import ForeignKey 
+from sqlalchemy.orm import relationship
 
 from app.database.base import Base
 
@@ -44,6 +46,8 @@ class RawArticle(Base):
     author: Mapped[str | None] = mapped_column(String(255), nullable=True)
     categories: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    
+    Indicators=relationship("Indicator", back_populates="raw_article", cascade="all, delete-orphan")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dict representation for logging and tests."""
@@ -61,3 +65,18 @@ class RawArticle(Base):
             "author": self.author,
             "categories": self.categories,
         }
+
+
+class Indicator(Base):
+    """A model for storing various indicators related to ingested content."""
+
+    __tablename__ = "indicators"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    raw_article_id: Mapped[int] = mapped_column(ForeignKey("raw_articles.id"), nullable=False, index=True)
+    indicator_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    indicator_value: Mapped[str] = mapped_column(String(2048), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+    # Relationship to RawArticle
+    raw_article: Mapped[RawArticle] = relationship("RawArticle", backref="indicators")
