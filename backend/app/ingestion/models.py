@@ -2,14 +2,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy import ForeignKey 
-from sqlalchemy.orm import relationship
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base
+
+
+class IOCType(StrEnum):
+    """Supported IOC types for Phase 3.1 extraction."""
+
+    CVE = "cve"
+    IPV4 = "ipv4"
+    IPV6 = "ipv6"
+    DOMAIN = "domain"
+    URL = "url"
+    EMAIL = "email"
+    MD5 = "md5"
+    SHA1 = "sha1"
+    SHA256 = "sha256"
 
 
 @dataclass(slots=True)
@@ -46,8 +59,12 @@ class RawArticle(Base):
     author: Mapped[str | None] = mapped_column(String(255), nullable=True)
     categories: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
-    
-    Indicators=relationship("Indicator", back_populates="raw_article", cascade="all, delete-orphan")
+    indicators: Mapped[list[Indicator]] = relationship(
+        "Indicator",
+        back_populates="raw_article",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dict representation for logging and tests."""
@@ -68,15 +85,30 @@ class RawArticle(Base):
 
 
 class Indicator(Base):
-    """A model for storing various indicators related to ingested content."""
+    """A model for storing extracted indicators of compromise (IOCs)."""
 
     __tablename__ = "indicators"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_article_id",
+            "indicator_type",
+            "indicator_value",
+            name="uq_indicators_article_type_value",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    raw_article_id: Mapped[int] = mapped_column(ForeignKey("raw_articles.id"), nullable=False, index=True)
-    indicator_type: Mapped[str] = mapped_column(String(255), nullable=False)
-    indicator_value: Mapped[str] = mapped_column(String(2048), nullable=False)
+    raw_article_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_articles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    indicator_type: Mapped[IOCType] = mapped_column(
+        Enum(IOCType, name="ioc_type"),
+        nullable=False,
+        index=True,
+    )
+    indicator_value: Mapped[str] = mapped_column(String(2048), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
 
-    # Relationship to RawArticle
-    raw_article: Mapped[RawArticle] = relationship("RawArticle", backref="indicators")
+    raw_article: Mapped[RawArticle] = relationship("RawArticle", back_populates="indicators")

@@ -40,7 +40,7 @@ class IngestionService:
         if self.feed_manager is None:
             raise ValueError("A feed manager instance is required")
 
-        stats = {"fetched": 0, "stored": 0, "duplicates": 0, "errors": 0}
+        stats = {"fetched": 0, "stored": 0, "duplicates": 0, "errors": 0, "iocs_extracted": 0}
         for source in self.registry.get_enabled_sources():
             try:
                 start_time = datetime.now(timezone.utc)
@@ -49,19 +49,21 @@ class IngestionService:
                 articles = self.normalizer.normalize(source, raw_content)
                 stats["fetched"] += len(articles)
                 for article in articles:
-                    stored = self.feed_manager.store(article)
+                    stored, ioc_count = self.feed_manager.store(article)
+                    stats["iocs_extracted"] += ioc_count
                     if stored:
                         stats["stored"] += 1
                     else:
                         stats["duplicates"] += 1
                 elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
                 logger.info(
-                    "Completed ingestion for %s in %.2fs with %s articles fetched, %s stored, %s duplicates",
+                    "Completed ingestion for %s in %.2fs with %s articles fetched, %s stored, %s duplicates, %s IOCs extracted",
                     source.name,
                     elapsed,
                     len(articles),
                     stats["stored"],
                     stats["duplicates"],
+                    stats["iocs_extracted"],
                 )
             except Exception as exc:  # pragma: no cover - error handling path
                 stats["errors"] += 1

@@ -27,5 +27,5 @@ class BaseFeedManager(ABC):
     """Interface for storing normalized articles."""
 
     @abstractmethod
-    def store(self, article: NormalizedArticle) -> bool:
+    def store(self, article: NormalizedArticle) -> tuple[bool, int]:
         """Persist a normalized article if it is new."""

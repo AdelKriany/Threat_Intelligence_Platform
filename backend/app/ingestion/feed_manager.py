@@ -1,33 +1,39 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
 
+from app.ingestion.ioc.extractor import IOCExtractionService
+from app.ingestion.ioc.persistence import persist_indicators
 from app.ingestion.models import NormalizedArticle, RawArticle
-from app.ingestion.registry import FeedSource
-
-logger = logging.getLogger(__name__)
 
 
 class FeedManager:
     """Persistence and duplicate management for ingested articles."""
 
-    def __init__(self, session_factory: Any) -> None:
+    def __init__(
+        self,
+        session_factory: Any,
+        ioc_extractor: IOCExtractionService | None = None,
+    ) -> None:
         self.session_factory = session_factory
+        self.ioc_extractor = ioc_extractor or IOCExtractionService()
 
-    def store(self, article: NormalizedArticle) -> bool:
-        """Persist a normalized article if it is not a duplicate."""
+    def store(self, article: NormalizedArticle) -> tuple[bool, int]:
+        """Persist a normalized article if it is not a duplicate.
+
+        Returns a tuple containing whether the article was stored and the number of IOC
+        records extracted for that article.
+        """
 
         content_hash = self._content_hash(article)
         with self.session_factory() as session:
             existing = session.scalar(select(RawArticle).where(RawArticle.content_hash == content_hash))
             if existing is not None:
-                return False
+                return False, 0
 
             raw_article = RawArticle(
                 source_id=article.source_id,
@@ -44,8 +50,15 @@ class FeedManager:
                 created_at=datetime.now(timezone.utc),
             )
             session.add(raw_article)
+
+            # Flush first to assign the raw article primary key used by indicators.
+            session.flush()
+
+            extracted_indicators = self.ioc_extractor.extract(raw_article)
+            persist_indicators(session, raw_article, extracted_indicators)
+
             session.commit()
-            return True
+            return True, len(extracted_indicators)
 
     def _content_hash(self, article: NormalizedArticle) -> str:
         seed = article.url or article.title or article.description or ""

@@ -66,11 +66,13 @@ def test_duplicate_detection_skips_existing_articles(sqlite_session_factory) -> 
         raw_content="raw",
     )
 
-    first_store = manager.store(article)
-    second_store = manager.store(article)
+    first_store, first_iocs = manager.store(article)
+    second_store, second_iocs = manager.store(article)
 
     assert first_store is True
+    assert first_iocs == 2
     assert second_store is False
+    assert second_iocs == 0
 
 
 def test_database_insertion_persists_raw_article(sqlite_session_factory) -> None:
@@ -87,8 +89,9 @@ def test_database_insertion_persists_raw_article(sqlite_session_factory) -> None
         raw_content="raw-body",
     )
 
-    stored = manager.store(article)
+    stored, ioc_count = manager.store(article)
     assert stored is True
+    assert ioc_count == 2
     assert manager.count() == 1
 
 
@@ -125,7 +128,7 @@ def test_rss_client_fetches_raw_content(monkeypatch: pytest.MonkeyPatch) -> None
         async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
             return None
 
-        async def get(self, url: str) -> FakeResponse:
+        async def get(self, url: str, **kwargs: object) -> FakeResponse:
             return FakeResponse("<rss />")
 
     monkeypatch.setattr("app.ingestion.rss_client.httpx.AsyncClient", FakeAsyncClient)
@@ -154,6 +157,7 @@ def test_ingestion_service_runs_and_persists_articles(sqlite_session_factory) ->
 
     assert stats["stored"] == 1
     assert stats["fetched"] == 1
+    assert stats["iocs_extracted"] == 2
     assert feed_manager.count() == 1
 
 
