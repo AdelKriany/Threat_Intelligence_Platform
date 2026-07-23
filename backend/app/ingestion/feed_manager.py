@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import func, select
 
+from app.core.config import settings
 from app.ingestion.ioc.extractor import IOCExtractionService
 from app.ingestion.ioc.persistence import persist_indicators
 from app.ingestion.models import NormalizedArticle, RawArticle
@@ -21,9 +22,11 @@ class FeedManager:
         self,
         session_factory: Any,
         ioc_extractor: IOCExtractionService | None = None,
+        enrichment_dispatcher: Any | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.ioc_extractor = ioc_extractor or IOCExtractionService()
+        self.enrichment_dispatcher = enrichment_dispatcher
 
     def store(self, article: NormalizedArticle) -> tuple[bool, int]:
         """Persist a normalized article if it is not a duplicate.
@@ -91,7 +94,29 @@ class FeedManager:
                 "Persisted %d indicators for raw_article_id=%s", persisted_count, raw_article_id
             )
 
+            if persisted_count:
+                self._dispatch_enrichment(raw_article_id)
+
             return True, persisted_count
+
+    def _dispatch_enrichment(self, raw_article_id: int) -> None:
+        """Dispatch only after indicator persistence has committed successfully."""
+
+        try:
+            if self.enrichment_dispatcher is not None:
+                self.enrichment_dispatcher(raw_article_id)
+            elif settings.enrichment_enabled:
+                from app.ingestion.enrichment.tasks import enrich_article_indicators_task
+
+                task = enrich_article_indicators_task.delay(raw_article_id)
+                logger.info(
+                    "Scheduled enrichment raw_article_id=%s task_id=%s",
+                    raw_article_id,
+                    task.id,
+                )
+        except Exception:
+            # Enrichment availability must never roll back or fail RSS ingestion.
+            logger.exception("Failed to schedule enrichment for raw_article_id=%s", raw_article_id)
 
     def _content_hash(self, article: NormalizedArticle) -> str:
         seed = article.url or article.title or article.description or ""

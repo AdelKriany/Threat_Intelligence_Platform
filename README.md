@@ -183,8 +183,21 @@ Example:
 
 ## Testing
 
-The repository includes a pytest smoke test for the health endpoint.
+The repository includes ingestion, IOC extraction, and IOC enrichment tests. Provider HTTP calls
+are mocked and the suite does not require API credentials or internet access.
 
 ```bash
 pytest
 ```
+
+Before enabling IOC enrichment, apply migrations with `alembic upgrade head`, configure the
+provider variables documented in [docs/architecture.md](docs/architecture.md), and start both a
+Celery worker and Celery Beat. Enrichment remains disabled by default so ingestion operates
+normally when providers or credentials are unavailable.
+
+The root `.env` is the Docker Compose runtime configuration source; `.env.example` is only a
+credential-free template. Compose interpolation occurs when containers are created, so recreate
+`api`, `celery-worker`, and `celery-beat` after changing enrichment values. NVD supports anonymous
+lookups with stricter rate limits. AbuseIPDB and VirusTotal should remain disabled when their API
+keys are absent. See the architecture documentation for safe single-indicator and five-item
+NVD-only backfill commands.

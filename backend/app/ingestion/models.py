@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import (
+    JSON,
     DateTime,
     Enum,
     ForeignKey,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base
@@ -137,3 +139,56 @@ class Indicator(Base):
     )
 
     raw_article: Mapped[RawArticle] = relationship("RawArticle", back_populates="indicators")
+    enrichments: Mapped[list[IndicatorEnrichment]] = relationship(
+        "IndicatorEnrichment",
+        back_populates="indicator",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class IndicatorEnrichment(Base):
+    """One provider's latest enrichment result for an indicator."""
+
+    __tablename__ = "indicator_enrichments"
+    __table_args__ = (
+        UniqueConstraint(
+            "indicator_id",
+            "provider",
+            name="uq_indicator_enrichments_indicator_provider",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    indicator_id: Mapped[int] = mapped_column(
+        ForeignKey("indicators.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    risk_score: Mapped[float | None] = mapped_column(nullable=True)
+    severity: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    normalized_data: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        default=dict,
+    )
+    raw_response: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    enriched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now
+    )
+
+    indicator: Mapped[Indicator] = relationship("Indicator", back_populates="enrichments")
