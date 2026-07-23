@@ -3,17 +3,26 @@ from __future__ import annotations
 import sys
 from logging.config import fileConfig
 from pathlib import Path
+from typing import Any
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
-if str(BACKEND) not in sys.path:
-    sys.path.insert(0, str(BACKEND))
 
-from app.core.config import settings
-from app.database.base import Base
+
+def _load_runtime_settings() -> tuple[Any, Any]:
+    if str(BACKEND) not in sys.path:
+        sys.path.insert(0, str(BACKEND))
+
+    from app.core.config import settings
+    from app.database.base import Base
+
+    return settings, Base
+
+
+settings, Base = _load_runtime_settings()
 
 config = context.config
 if config.config_file_name is not None:

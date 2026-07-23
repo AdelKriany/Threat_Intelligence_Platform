@@ -22,12 +22,18 @@ class RSSNormalizer:
         parsed = feedparser.parse(raw_content)
         articles: list[NormalizedArticle] = []
         for entry in parsed.entries:
-            published_at = self._coerce_datetime(entry.get("published")) or self._coerce_datetime(entry.get("updated"))
+            published_at = self._coerce_datetime(entry.get("published")) or self._coerce_datetime(
+                entry.get("updated")
+            )
             title = self._safe_text(entry.get("title"))
             description = self._safe_text(entry.get("summary") or entry.get("description"))
             url = self._safe_text(entry.get("link"))
             author = self._safe_text(entry.get("author"))
-            categories = [self._safe_text(tag.get("term")) for tag in entry.get("tags", []) if self._safe_text(tag.get("term"))]
+            categories: list[str] = []
+            for tag in entry.get("tags", []):
+                term = self._safe_text(tag.get("term"))
+                if term is not None:
+                    categories.append(term)
             articles.append(
                 NormalizedArticle(
                     source_id=source.name,

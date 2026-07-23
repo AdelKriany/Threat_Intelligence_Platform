@@ -21,7 +21,9 @@ IOC_PATTERNS: tuple[IOCPattern, ...] = (
     ),
     IOCPattern(
         indicator_type=IOCType.IPV4,
-        expression=re.compile(r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b"),
+        expression=re.compile(
+            r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b"
+        ),
     ),
     IOCPattern(
         indicator_type=IOCType.IPV6,

@@ -1,9 +1,28 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
+from app.enrichment.extractor import (
+    extract_cves,
+    extract_emails,
+    extract_ipv4,
+    extract_sha256,
+    extract_urls,
+)
 from app.ingestion.ioc.patterns import IOC_PATTERNS, IOCPattern
 from app.ingestion.ioc.types import ExtractedIndicator
 from app.ingestion.ioc.validators import normalize_indicator
-from app.ingestion.models import RawArticle
+from app.ingestion.models import IOCType, RawArticle
+
+_ENRICHMENT_EXTRACTORS: tuple[tuple[IOCType, Callable[[str], list[str]]], ...] = (
+    (IOCType.CVE, extract_cves),
+    (IOCType.IPV4, extract_ipv4),
+    (IOCType.URL, extract_urls),
+    (IOCType.EMAIL, extract_emails),
+    (IOCType.SHA256, extract_sha256),
+)
+
+_ENRICHMENT_TYPES = {indicator_type for indicator_type, _ in _ENRICHMENT_EXTRACTORS}
 
 
 class IOCExtractionService:
@@ -20,7 +39,19 @@ class IOCExtractionService:
             return []
 
         found: set[ExtractedIndicator] = set()
+        for indicator_type, extractor in _ENRICHMENT_EXTRACTORS:
+            for value in extractor(content):
+                found.add(
+                    ExtractedIndicator(
+                        indicator_type=indicator_type,
+                        indicator_value=value,
+                    )
+                )
+
+        # Optional IOC types not yet exposed by enrichment extractors.
         for pattern in self.patterns:
+            if pattern.indicator_type in _ENRICHMENT_TYPES:
+                continue
             for match in pattern.expression.finditer(content):
                 normalized = normalize_indicator(pattern.indicator_type, match.group(0))
                 if normalized is None:

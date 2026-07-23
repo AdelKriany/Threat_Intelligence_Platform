@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any
 
 from app.database.session import SessionLocal
+from app.ingestion.base import RSSClientProtocol
 from app.ingestion.feed_manager import FeedManager
 from app.ingestion.normalizer import RSSNormalizer
-from app.ingestion.registry import FeedRegistry, FeedSource
+from app.ingestion.registry import FeedRegistry
 from app.ingestion.rss_client import RSSClient
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ class IngestionService:
     def __init__(
         self,
         registry: FeedRegistry | None = None,
-        rss_client: RSSClient | None = None,
+        rss_client: RSSClientProtocol | None = None,
         normalizer: RSSNormalizer | None = None,
         feed_manager: FeedManager | None = None,
     ) -> None:

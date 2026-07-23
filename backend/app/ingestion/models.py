@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 class IOCType(StrEnum):
@@ -23,6 +35,10 @@ class IOCType(StrEnum):
     MD5 = "md5"
     SHA1 = "sha1"
     SHA256 = "sha256"
+
+
+def _ioc_type_values(enum_type: type[IOCType]) -> list[str]:
+    return [member.value for member in enum_type]
 
 
 @dataclass(slots=True)
@@ -58,7 +74,9 @@ class RawArticle(Base):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     author: Mapped[str | None] = mapped_column(String(255), nullable=True)
     categories: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
     indicators: Mapped[list[Indicator]] = relationship(
         "Indicator",
         back_populates="raw_article",
@@ -104,11 +122,18 @@ class Indicator(Base):
         index=True,
     )
     indicator_type: Mapped[IOCType] = mapped_column(
-        Enum(IOCType, name="ioc_type"),
+        Enum(
+            IOCType,
+            name="ioc_type",
+            values_callable=_ioc_type_values,
+            validate_strings=True,
+        ),
         nullable=False,
         index=True,
     )
     indicator_value: Mapped[str] = mapped_column(String(2048), nullable=False, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
 
     raw_article: Mapped[RawArticle] = relationship("RawArticle", back_populates="indicators")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Protocol
 
 from app.ingestion.models import NormalizedArticle
 from app.ingestion.registry import FeedSource
@@ -29,3 +29,10 @@ class BaseFeedManager(ABC):
     @abstractmethod
     def store(self, article: NormalizedArticle) -> tuple[bool, int]:
         """Persist a normalized article if it is new."""
+
+
+class RSSClientProtocol(Protocol):
+    """Protocol for RSS clients consumed by ingestion service."""
+
+    async def fetch(self, source: FeedSource) -> str:
+        """Retrieve raw content for a feed source."""

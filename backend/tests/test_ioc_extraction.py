@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from sqlalchemy import Enum as SQLEnum
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.database.base import Base
 from app.ingestion.feed_manager import FeedManager
 from app.ingestion.ioc.extractor import IOCExtractionService
-from app.ingestion.models import IOCType, Indicator, NormalizedArticle, RawArticle
+from app.ingestion.models import Indicator, IOCType, NormalizedArticle, RawArticle
 
 
 def _build_raw_article(content: str, url: str | None = "https://unit.test/article") -> RawArticle:
@@ -119,3 +120,9 @@ def test_feed_manager_persists_extracted_indicators() -> None:
     assert IOCType.DOMAIN in stored_types
     assert IOCType.IPV4 in stored_types
     assert IOCType.EMAIL in stored_types
+
+
+def test_indicator_enum_persists_lowercase_values() -> None:
+    enum_type = Indicator.__table__.c.indicator_type.type
+    assert isinstance(enum_type, SQLEnum)
+    assert enum_type.enums == [member.value for member in IOCType]

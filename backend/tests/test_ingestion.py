@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Generator
 from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.database.base import Base
 from app.ingestion.feed_manager import FeedManager
-from app.ingestion.models import NormalizedArticle
+from app.ingestion.models import Indicator, IOCType, NormalizedArticle, RawArticle
 from app.ingestion.normalizer import RSSNormalizer
 from app.ingestion.registry import FeedRegistry, FeedSource
 from app.ingestion.rss_client import RSSClient
@@ -18,7 +19,7 @@ from app.ingestion.services import IngestionService
 
 
 @pytest.fixture()
-def sqlite_session_factory():
+def sqlite_session_factory() -> Generator[sessionmaker[Session], None, None]:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -52,7 +53,9 @@ def test_rss_parsing_normalizes_entries() -> None:
     assert articles[0].url == "https://example.com/1"
 
 
-def test_duplicate_detection_skips_existing_articles(sqlite_session_factory) -> None:
+def test_duplicate_detection_skips_existing_articles(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
     manager = FeedManager(session_factory=sqlite_session_factory)
     article = NormalizedArticle(
         source_id="Demo Feed",
@@ -75,7 +78,9 @@ def test_duplicate_detection_skips_existing_articles(sqlite_session_factory) -> 
     assert second_iocs == 0
 
 
-def test_database_insertion_persists_raw_article(sqlite_session_factory) -> None:
+def test_database_insertion_persists_raw_article(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
     manager = FeedManager(session_factory=sqlite_session_factory)
     article = NormalizedArticle(
         source_id="Demo Feed",
@@ -95,11 +100,142 @@ def test_database_insertion_persists_raw_article(sqlite_session_factory) -> None
     assert manager.count() == 1
 
 
+def test_article_with_no_iocs_persists_zero_indicators(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    manager = FeedManager(session_factory=sqlite_session_factory)
+    article = NormalizedArticle(
+        source_id="Demo Feed",
+        title="No indicators here",
+        description="A benign status update with no IOC content",
+        url=None,
+        published_at=datetime.now(timezone.utc),
+        author="Analyst",
+        categories=["news"],
+        source_name="Demo Feed",
+        raw_content="This text contains no indicators at all.",
+    )
+
+    stored, ioc_count = manager.store(article)
+
+    assert stored is True
+    assert ioc_count == 0
+    with sqlite_session_factory() as session:
+        assert session.query(Indicator).count() == 0
+
+
+def test_duplicate_iocs_in_one_article_create_one_row(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    manager = FeedManager(session_factory=sqlite_session_factory)
+    article = NormalizedArticle(
+        source_id="Demo Feed",
+        title="Repeated IOC",
+        description="8.8.8.8 8.8.8.8 8.8.8.8",
+        url=None,
+        published_at=datetime.now(timezone.utc),
+        author="Analyst",
+        categories=["network"],
+        source_name="Demo Feed",
+        raw_content="Observed beaconing to 8.8.8.8 again.",
+    )
+
+    stored, ioc_count = manager.store(article)
+
+    assert stored is True
+    assert ioc_count == 1
+    with sqlite_session_factory() as session:
+        indicators = session.query(Indicator).all()
+        assert len(indicators) == 1
+        assert indicators[0].indicator_type == IOCType.IPV4
+        assert indicators[0].indicator_value == "8.8.8.8"
+
+
+def test_same_ioc_in_different_articles_is_stored_per_article(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    manager = FeedManager(session_factory=sqlite_session_factory)
+    first = NormalizedArticle(
+        source_id="Demo Feed",
+        title="First IOC report",
+        description="IOC 9.9.9.9 observed",
+        url=None,
+        published_at=datetime.now(timezone.utc),
+        author="Analyst",
+        categories=["network"],
+        source_name="Demo Feed",
+        raw_content="9.9.9.9",
+    )
+    second = NormalizedArticle(
+        source_id="Demo Feed",
+        title="Second IOC report",
+        description="IOC 9.9.9.9 observed again",
+        url=None,
+        published_at=datetime.now(timezone.utc),
+        author="Analyst",
+        categories=["network"],
+        source_name="Demo Feed",
+        raw_content="9.9.9.9",
+    )
+
+    first_stored, first_count = manager.store(first)
+    second_stored, second_count = manager.store(second)
+
+    assert first_stored is True
+    assert second_stored is True
+    assert first_count == 1
+    assert second_count == 1
+
+    with sqlite_session_factory() as session:
+        indicators = (
+            session.query(Indicator)
+            .filter(
+                Indicator.indicator_type == IOCType.IPV4, Indicator.indicator_value == "9.9.9.9"
+            )
+            .all()
+        )
+        assert len(indicators) == 2
+        assert indicators[0].raw_article_id != indicators[1].raw_article_id
+
+
+def test_indicators_reference_their_source_article(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    manager = FeedManager(session_factory=sqlite_session_factory)
+    article = NormalizedArticle(
+        source_id="Demo Feed",
+        title="Reference test",
+        description="CVE-2026-12345 is present",
+        url=None,
+        published_at=datetime.now(timezone.utc),
+        author="Analyst",
+        categories=["vuln"],
+        source_name="Demo Feed",
+        raw_content="",
+    )
+
+    stored, ioc_count = manager.store(article)
+
+    assert stored is True
+    assert ioc_count == 1
+
+    with sqlite_session_factory() as session:
+        raw_article = session.query(RawArticle).filter(RawArticle.url == article.url).one()
+        indicator = (
+            session.query(Indicator).filter(Indicator.raw_article_id == raw_article.id).one()
+        )
+
+        assert indicator.raw_article_id == raw_article.id
+        assert indicator.raw_article.id == raw_article.id
+
+
 def test_scheduler_builds_beat_schedule() -> None:
     registry = FeedRegistry(
         [
             FeedSource(name="Feed A", url="https://example.com/a", poll_interval_minutes=10),
-            FeedSource(name="Feed B", url="https://example.com/b", poll_interval_minutes=20, enabled=False),
+            FeedSource(
+                name="Feed B", url="https://example.com/b", poll_interval_minutes=20, enabled=False
+            ),
         ]
     )
 
@@ -134,12 +270,18 @@ def test_rss_client_fetches_raw_content(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr("app.ingestion.rss_client.httpx.AsyncClient", FakeAsyncClient)
     client = RSSClient(timeout=1.0, max_retries=1)
 
-    content = asyncio.run(client.fetch(FeedSource(name="Test", url="https://example.com/rss", poll_interval_minutes=5)))
+    content = asyncio.run(
+        client.fetch(
+            FeedSource(name="Test", url="https://example.com/rss", poll_interval_minutes=5)
+        )
+    )
 
     assert content == "<rss />"
 
 
-def test_ingestion_service_runs_and_persists_articles(sqlite_session_factory) -> None:
+def test_ingestion_service_runs_and_persists_articles(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
     class FakeClient:
         async def fetch(self, source: FeedSource) -> str:
             return """<?xml version=\"1.0\"?>
@@ -150,8 +292,12 @@ def test_ingestion_service_runs_and_persists_articles(sqlite_session_factory) ->
             </rss>"""
 
     feed_manager = FeedManager(session_factory=sqlite_session_factory)
-    registry = FeedRegistry([FeedSource(name="Service Feed", url="https://example.com/rss", poll_interval_minutes=5)])
-    service = IngestionService(registry=registry, rss_client=FakeClient(), feed_manager=feed_manager)
+    registry = FeedRegistry(
+        [FeedSource(name="Service Feed", url="https://example.com/rss", poll_interval_minutes=5)]
+    )
+    service = IngestionService(
+        registry=registry, rss_client=FakeClient(), feed_manager=feed_manager
+    )
 
     stats = service.run_all()
 
@@ -162,7 +308,10 @@ def test_ingestion_service_runs_and_persists_articles(sqlite_session_factory) ->
 
 
 def test_registry_from_settings_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("INGESTION_FEEDS_JSON", '[{"name": "Env Feed", "url": "https://example.com/env", "poll_interval_minutes": 7}]')
+    monkeypatch.setenv(
+        "INGESTION_FEEDS_JSON",
+        '[{"name": "Env Feed", "url": "https://example.com/env", "poll_interval_minutes": 7}]',
+    )
 
     registry = FeedRegistry.from_settings()
 

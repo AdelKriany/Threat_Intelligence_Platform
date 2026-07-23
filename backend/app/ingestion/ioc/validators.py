@@ -6,7 +6,6 @@ from urllib.parse import urlparse
 
 from app.ingestion.models import IOCType
 
-
 _TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
 
 

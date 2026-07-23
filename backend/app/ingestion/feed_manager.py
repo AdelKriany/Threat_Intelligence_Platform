@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -9,6 +10,8 @@ from sqlalchemy import func, select
 from app.ingestion.ioc.extractor import IOCExtractionService
 from app.ingestion.ioc.persistence import persist_indicators
 from app.ingestion.models import NormalizedArticle, RawArticle
+
+logger = logging.getLogger(__name__)
 
 
 class FeedManager:
@@ -31,8 +34,11 @@ class FeedManager:
 
         content_hash = self._content_hash(article)
         with self.session_factory() as session:
-            existing = session.scalar(select(RawArticle).where(RawArticle.content_hash == content_hash))
+            existing = session.scalar(
+                select(RawArticle).where(RawArticle.content_hash == content_hash)
+            )
             if existing is not None:
+                logger.info("Skipped duplicate article content_hash=%s", content_hash)
                 return False, 0
 
             raw_article = RawArticle(
@@ -50,15 +56,42 @@ class FeedManager:
                 created_at=datetime.now(timezone.utc),
             )
             session.add(raw_article)
-
-            # Flush first to assign the raw article primary key used by indicators.
+            # Flush and commit first so raw article persistence is isolated from IOC failures.
             session.flush()
-
-            extracted_indicators = self.ioc_extractor.extract(raw_article)
-            persist_indicators(session, raw_article, extracted_indicators)
-
+            raw_article_id = raw_article.id
             session.commit()
-            return True, len(extracted_indicators)
+            logger.info("Stored article id=%s", raw_article_id)
+
+            try:
+                extracted_indicators = self.ioc_extractor.extract(raw_article)
+            except Exception:
+                logger.exception("IOC extraction failed for raw_article_id=%s", raw_article_id)
+                return True, 0
+
+            logger.info(
+                "Extracted %d IOCs for raw_article_id=%s",
+                len(extracted_indicators),
+                raw_article_id,
+            )
+
+            if not extracted_indicators:
+                return True, 0
+
+            try:
+                persisted_count = persist_indicators(session, raw_article_id, extracted_indicators)
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception(
+                    "Indicator persistence failed for raw_article_id=%s", raw_article_id
+                )
+                return True, 0
+
+            logger.info(
+                "Persisted %d indicators for raw_article_id=%s", persisted_count, raw_article_id
+            )
+
+            return True, persisted_count
 
     def _content_hash(self, article: NormalizedArticle) -> str:
         seed = article.url or article.title or article.description or ""

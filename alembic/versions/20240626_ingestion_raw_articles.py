@@ -5,9 +5,9 @@ Revises: 3f7b8817d2de
 Create Date: 2026-06-26 00:00:00.000000
 
 """
-from alembic import op
-import sqlalchemy as sa
 
+import sqlalchemy as sa
+from alembic import op
 
 revision = "dd6ff59cc6bb"
 down_revision = "3f7b8817d2de"
@@ -36,9 +36,13 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("content_hash"),
     )
-    op.create_index(op.f("ix_raw_articles_content_hash"), "raw_articles", ["content_hash"], unique=True)
+    op.create_index(
+        op.f("ix_raw_articles_content_hash"), "raw_articles", ["content_hash"], unique=True
+    )
     op.create_index(op.f("ix_raw_articles_source_id"), "raw_articles", ["source_id"], unique=False)
-    op.create_index(op.f("ix_raw_articles_source_name"), "raw_articles", ["source_name"], unique=False)
+    op.create_index(
+        op.f("ix_raw_articles_source_name"), "raw_articles", ["source_name"], unique=False
+    )
     op.create_index(op.f("ix_raw_articles_url"), "raw_articles", ["url"], unique=False)
 
 

@@ -5,10 +5,10 @@ Revises: 4a2abfa08cbe
 Create Date: 2026-07-16 00:00:00.000000
 
 """
-from alembic import op
-import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
 
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
 
 revision = "2d1d8a617db8"
 down_revision = "4a2abfa08cbe"
@@ -51,9 +51,15 @@ def upgrade() -> None:
         ),
     )
 
-    op.create_index(op.f("ix_indicators_raw_article_id"), "indicators", ["raw_article_id"], unique=False)
-    op.create_index(op.f("ix_indicators_indicator_type"), "indicators", ["indicator_type"], unique=False)
-    op.create_index(op.f("ix_indicators_indicator_value"), "indicators", ["indicator_value"], unique=False)
+    op.create_index(
+        op.f("ix_indicators_raw_article_id"), "indicators", ["raw_article_id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_indicators_indicator_type"), "indicators", ["indicator_type"], unique=False
+    )
+    op.create_index(
+        op.f("ix_indicators_indicator_value"), "indicators", ["indicator_value"], unique=False
+    )
 
 
 def downgrade() -> None:

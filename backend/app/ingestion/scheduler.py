@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from celery import shared_task
 
-from app.ingestion.registry import FeedRegistry, FeedSource
+from app.ingestion.registry import FeedRegistry
 from app.ingestion.services import IngestionService
 
 logger = logging.getLogger(__name__)
@@ -34,4 +34,3 @@ def build_beat_schedule(registry: FeedRegistry | None = None) -> dict[str, dict]
             "args": (source.name,),
         }
     return schedule
-
