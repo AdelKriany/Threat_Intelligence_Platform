@@ -28,6 +28,7 @@ from app.ingestion.enrichment.tasks import build_pending_indicator_query
 from app.ingestion.enrichment.types import EnrichmentResult, EnrichmentStatus
 from app.ingestion.feed_manager import FeedManager
 from app.ingestion.models import (
+    ArticleIndicator,
     Indicator,
     IndicatorEnrichment,
     IOCType,
@@ -53,11 +54,10 @@ def enrichment_db() -> Generator[tuple[sessionmaker[Session], int], None, None]:
         session.add(article)
         session.flush()
         indicator = Indicator(
-            raw_article_id=article.id,
             indicator_type=IOCType.CVE,
             indicator_value="CVE-2026-12345",
         )
-        session.add(indicator)
+        article.indicators.append(indicator)
         session.commit()
         indicator_id = indicator.id
     yield factory, indicator_id
@@ -415,22 +415,22 @@ def test_nvd_only_backfill_selects_missing_cves_and_honors_limit(
     with factory() as session:
         article_id = session.scalar(select(RawArticle.id))
         assert article_id is not None
+        indicators = [
+            Indicator(
+                indicator_type=IOCType.CVE,
+                indicator_value=f"CVE-2026-{number}",
+            )
+            for number in range(20000, 20004)
+        ] + [
+            Indicator(
+                indicator_type=IOCType.DOMAIN,
+                indicator_value="not-for-nvd.example",
+            )
+        ]
+        session.add_all(indicators)
+        session.flush()
         session.add_all(
-            [
-                Indicator(
-                    raw_article_id=article_id,
-                    indicator_type=IOCType.CVE,
-                    indicator_value=f"CVE-2026-{number}",
-                )
-                for number in range(20000, 20004)
-            ]
-            + [
-                Indicator(
-                    raw_article_id=article_id,
-                    indicator_type=IOCType.DOMAIN,
-                    indicator_value="not-for-nvd.example",
-                )
-            ]
+            ArticleIndicator(raw_article_id=article_id, indicator_id=item.id) for item in indicators
         )
         session.commit()
         registry = ProviderRegistry([NVDProvider(enabled=True, api_key=None)])
@@ -465,8 +465,8 @@ def test_article_dispatch_occurs_after_indicator_commit(
         dispatched.append(raw_article_id)
         with factory() as verification_session:
             committed_counts.append(
-                verification_session.query(Indicator)
-                .filter(Indicator.raw_article_id == raw_article_id)
+                verification_session.query(ArticleIndicator)
+                .filter(ArticleIndicator.raw_article_id == raw_article_id)
                 .count()
             )
 
@@ -486,7 +486,9 @@ def test_article_dispatch_occurs_after_indicator_commit(
     assert committed_counts == [count]
     with factory() as session:
         assert (
-            session.query(Indicator).filter(Indicator.raw_article_id == dispatched[0]).count()
+            session.query(ArticleIndicator)
+            .filter(ArticleIndicator.raw_article_id == dispatched[0])
+            .count()
             == count
         )
 

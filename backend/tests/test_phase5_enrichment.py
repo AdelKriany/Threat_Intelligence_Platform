@@ -27,6 +27,7 @@ from app.ingestion.enrichment.service import EnrichmentService
 from app.ingestion.enrichment.tasks import build_pending_indicator_query, restrict_registry
 from app.ingestion.enrichment.types import EnrichmentResult, EnrichmentStatus
 from app.ingestion.models import (
+    ArticleIndicator,
     EPSSHistory,
     Indicator,
     IndicatorEnrichment,
@@ -77,13 +78,16 @@ def phase5_db() -> Generator[tuple[sessionmaker[Session], list[int]], None, None
         session.flush()
         indicators = [
             Indicator(
-                raw_article_id=article.id,
                 indicator_type=IOCType.CVE,
                 indicator_value=f"CVE-2026-{number}",
             )
             for number in (12345, 12346, 12347, 12348, 12349)
         ]
         session.add_all(indicators)
+        session.flush()
+        session.add_all(
+            ArticleIndicator(raw_article_id=article.id, indicator_id=item.id) for item in indicators
+        )
         session.commit()
         ids = [indicator.id for indicator in indicators]
     yield factory, ids

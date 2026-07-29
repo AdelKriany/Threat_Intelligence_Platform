@@ -20,7 +20,7 @@ from app.ingestion.enrichment.providers.epss import EPSSProvider
 from app.ingestion.enrichment.registry import ProviderRegistry
 from app.ingestion.enrichment.service import EnrichmentService
 from app.ingestion.enrichment.types import EnrichmentResult, EnrichmentStatus
-from app.ingestion.models import Indicator, IndicatorEnrichment
+from app.ingestion.models import ArticleIndicator, Indicator, IndicatorEnrichment
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,11 @@ def enrich_article_indicators_task(
         indicator_ids = list(
             session.scalars(
                 select(Indicator.id)
-                .where(Indicator.raw_article_id == raw_article_id)
+                .join(
+                    ArticleIndicator,
+                    ArticleIndicator.indicator_id == Indicator.id,
+                )
+                .where(ArticleIndicator.raw_article_id == raw_article_id)
                 .order_by(Indicator.id)
             )
         )
@@ -98,6 +102,7 @@ def build_pending_indicator_query(
     now: datetime,
     limit: int,
     provider_name: str | None = None,
+    raw_article_id: int | None = None,
 ) -> Select[tuple[int]]:
     """Select supported indicators missing a current result, optionally for one provider."""
 
@@ -146,7 +151,30 @@ def build_pending_indicator_query(
         )
     if not conditions:
         return select(Indicator.id).where(false())
-    return select(Indicator.id).where(or_(*conditions)).order_by(Indicator.id).limit(limit)
+    query = select(Indicator.id)
+    if raw_article_id is not None:
+        query = query.join(
+            ArticleIndicator,
+            ArticleIndicator.indicator_id == Indicator.id,
+        ).where(ArticleIndicator.raw_article_id == raw_article_id)
+    return query.where(or_(*conditions)).order_by(Indicator.id).limit(limit)
+
+
+def article_has_pending_enrichment(session: Any, raw_article_id: int) -> bool:
+    """Return whether an article mentions a canonical IOC needing provider work."""
+
+    registry = ProviderRegistry.from_settings()
+    return (
+        session.scalar(
+            build_pending_indicator_query(
+                registry,
+                now=datetime.now(UTC),
+                limit=1,
+                raw_article_id=raw_article_id,
+            )
+        )
+        is not None
+    )
 
 
 @celery_app.task(name="app.ingestion.enrichment.tasks.enrich_pending_batch_task")

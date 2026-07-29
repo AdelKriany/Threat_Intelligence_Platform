@@ -94,10 +94,20 @@ class FeedManager:
                 "Persisted %d indicators for raw_article_id=%s", persisted_count, raw_article_id
             )
 
-            if persisted_count:
+            if persisted_count and self._should_dispatch_enrichment(session, raw_article_id):
                 self._dispatch_enrichment(raw_article_id)
 
             return True, persisted_count
+
+    def _should_dispatch_enrichment(self, session: Any, raw_article_id: int) -> bool:
+        if self.enrichment_dispatcher is not None:
+            return True
+        if not settings.enrichment_enabled:
+            return False
+
+        from app.ingestion.enrichment.tasks import article_has_pending_enrichment
+
+        return article_has_pending_enrichment(session, raw_article_id)
 
     def _dispatch_enrichment(self, raw_article_id: int) -> None:
         """Dispatch only after indicator persistence has committed successfully."""

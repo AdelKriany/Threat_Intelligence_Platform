@@ -84,8 +84,8 @@ class RawArticle(Base):
     )
     indicators: Mapped[list[Indicator]] = relationship(
         "Indicator",
-        back_populates="raw_article",
-        cascade="all, delete-orphan",
+        secondary="article_indicators",
+        back_populates="articles",
         passive_deletes=True,
     )
 
@@ -108,24 +108,18 @@ class RawArticle(Base):
 
 
 class Indicator(Base):
-    """A model for storing extracted indicators of compromise (IOCs)."""
+    """One canonical normalized indicator shared by all mentioning articles."""
 
     __tablename__ = "indicators"
     __table_args__ = (
         UniqueConstraint(
-            "raw_article_id",
             "indicator_type",
             "indicator_value",
-            name="uq_indicators_article_type_value",
+            name="uq_indicators_type_value",
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    raw_article_id: Mapped[int] = mapped_column(
-        ForeignKey("raw_articles.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
     indicator_type: Mapped[IOCType] = mapped_column(
         Enum(
             IOCType,
@@ -141,7 +135,12 @@ class Indicator(Base):
         DateTime(timezone=True), nullable=False, default=_utc_now
     )
 
-    raw_article: Mapped[RawArticle] = relationship("RawArticle", back_populates="indicators")
+    articles: Mapped[list[RawArticle]] = relationship(
+        "RawArticle",
+        secondary="article_indicators",
+        back_populates="indicators",
+        passive_deletes=True,
+    )
     enrichments: Mapped[list[IndicatorEnrichment]] = relationship(
         "IndicatorEnrichment",
         back_populates="indicator",
@@ -231,3 +230,23 @@ class EPSSHistory(Base):
     )
 
     indicator: Mapped[Indicator] = relationship("Indicator", back_populates="epss_history")
+
+
+class ArticleIndicator(Base):
+    """Unique article mention of a canonical indicator."""
+
+    __tablename__ = "article_indicators"
+
+    raw_article_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_articles.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    indicator_id: Mapped[int] = mapped_column(
+        ForeignKey("indicators.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )

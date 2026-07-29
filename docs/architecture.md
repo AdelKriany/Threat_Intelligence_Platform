@@ -2,6 +2,141 @@
 
 This directory holds conceptual documentation for the Phase 1 foundation.
 
+## Canonical indicators and article mentions
+
+Before revision `b74f3c9a21de`, each extracted IOC belonged directly to one article.
+The same CVE therefore received many indicator IDs and repeated provider results. The
+canonical model is now:
+
+```text
+raw_articles ──< article_indicators >── indicators ──< indicator_enrichments
+                                             └──────< epss_history
+```
+
+`indicators` is unique on `(indicator_type, indicator_value)`;
+`article_indicators` is unique on `(raw_article_id, indicator_id)`. Deleting an article
+cascades only its associations, never a shared indicator. Deleting an indicator still
+cascades its associations, current enrichment, and EPSS history.
+
+Canonical identity follows existing extraction behavior: validated CVEs are uppercase;
+hashes, domains, and emails are lowercase; trailing domain dots are removed; IPs use
+Python `ipaddress` canonical form; and validated HTTP(S) URLs retain their exact
+existing representation. Type is part of identity. Invalid legacy values remain
+verbatim during migration rather than aborting or being silently merged.
+
+The lowest old ID becomes canonical. Colliding provider rows rank `success`,
+`not_found`, `rate_limited`, `temporary_failure`, `permanent_failure`, `auth_error`,
+then `failed`; latest timestamps and ID break equal-status ties. An older success
+therefore beats a newer failure. Same-date EPSS history keeps the latest fetched
+observation. Provider data is neither merged nor fabricated.
+
+NVD `risk_score` remains provider-native scaled CVSS data, not the future Phase 6
+combined ThreatLens score.
+
+### Safe deployment, backup, and recovery
+
+Inspect state, confirm `.env` is ignored, and record the revision:
+
+```bash
+git status --short
+git check-ignore -v .env
+docker compose ps
+docker compose exec -T postgres psql -U threatlens -d threatlens -Atc \
+  "SELECT version_num FROM alembic_version"
+```
+
+Create and verify a custom-format backup:
+
+```bash
+docker compose exec -T postgres pg_dump \
+  -U threatlens -d threatlens -Fc > threatlens_before_indicator_dedup.dump
+test -s threatlens_before_indicator_dedup.dump
+```
+
+Restore only into a separately created recovery database:
+
+```bash
+docker compose exec -T postgres createdb -U threatlens threatlens_recovery
+docker compose exec -T postgres pg_restore \
+  -U threatlens -d threatlens_recovery --clean --if-exists \
+  < threatlens_before_indicator_dedup.dump
+```
+
+After recording the pre-migration SQL below, stop writers and use a one-off container
+because the normal API container is stopped:
+
+```bash
+docker compose stop api celery-worker celery-beat
+docker compose run --rm --no-deps api alembic upgrade head
+docker compose up -d api celery-worker celery-beat
+docker compose exec -T celery-worker \
+  celery -A app.workers.celery_app inspect registered
+```
+
+Review this migration against a restored staging copy before production. No automatic
+full enrichment backfill is needed.
+
+### Migration validation SQL
+
+Capture before migration:
+
+```sql
+SELECT count(*) AS indicator_rows FROM indicators;
+SELECT count(*) AS represented_mentions FROM indicators;
+SELECT count(*) AS exact_identities
+FROM (SELECT DISTINCT indicator_type, indicator_value FROM indicators) identity;
+SELECT provider, status, count(*) FROM indicator_enrichments GROUP BY 1, 2 ORDER BY 1, 2;
+SELECT indicator_type, indicator_value, count(*)
+FROM indicators GROUP BY 1, 2 HAVING count(*) > 1 ORDER BY count(*) DESC;
+SELECT i.indicator_type, i.indicator_value, e.provider, count(*)
+FROM indicators i JOIN indicator_enrichments e ON e.indicator_id = i.id
+GROUP BY 1, 2, 3 HAVING count(*) > 1 ORDER BY count(*) DESC;
+```
+
+After migration, the duplicate and orphan queries must return no rows:
+
+```sql
+SELECT indicator_type, indicator_value, count(*)
+FROM indicators GROUP BY 1, 2 HAVING count(*) > 1;
+SELECT raw_article_id, indicator_id, count(*)
+FROM article_indicators GROUP BY 1, 2 HAVING count(*) > 1;
+SELECT indicator_id, provider, count(*)
+FROM indicator_enrichments GROUP BY 1, 2 HAVING count(*) > 1;
+SELECT ai.* FROM article_indicators ai
+LEFT JOIN raw_articles a ON a.id = ai.raw_article_id
+LEFT JOIN indicators i ON i.id = ai.indicator_id
+WHERE a.id IS NULL OR i.id IS NULL;
+SELECT e.* FROM indicator_enrichments e
+LEFT JOIN indicators i ON i.id = e.indicator_id WHERE i.id IS NULL;
+```
+
+Compare semantic counts and a known repeated CVE:
+
+```sql
+SELECT count(*) AS unique_indicators FROM indicators;
+SELECT count(*) AS mentions FROM article_indicators;
+SELECT provider, status, count(*) AS provider_rows
+FROM indicator_enrichments GROUP BY 1, 2 ORDER BY 1, 2;
+SELECT i.indicator_value, count(*) AS mentioning_articles
+FROM indicators i JOIN article_indicators ai ON ai.indicator_id = i.id
+WHERE i.indicator_value = 'CVE-2026-15409'
+GROUP BY i.indicator_value;
+```
+
+Display distinct NVD CVSS results without multiplying article mentions:
+
+```sql
+SELECT i.indicator_value, e.risk_score, e.severity, e.enriched_at
+FROM indicators i JOIN indicator_enrichments e ON e.indicator_id = i.id
+WHERE i.indicator_type = 'cve' AND e.provider = 'nvd' AND e.status = 'success'
+ORDER BY e.risk_score DESC NULLS LAST, i.indicator_value;
+```
+
+The downgrade is structurally valid but lossy: it assigns each canonical indicator to
+its lowest associated article and discards additional associations. It refuses orphan
+canonical indicators. For lossless production recovery, stop writers, restore the
+verified dump, deploy the previous application image, and restart services.
+
 ## Current scope
 
 - FastAPI application factory

@@ -10,7 +10,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.database.base import Base
 from app.ingestion.feed_manager import FeedManager
-from app.ingestion.models import Indicator, IOCType, NormalizedArticle, RawArticle
+from app.ingestion.models import (
+    ArticleIndicator,
+    Indicator,
+    IOCType,
+    NormalizedArticle,
+    RawArticle,
+)
 from app.ingestion.normalizer import RSSNormalizer
 from app.ingestion.registry import FeedRegistry, FeedSource
 from app.ingestion.rss_client import RSSClient
@@ -151,7 +157,7 @@ def test_duplicate_iocs_in_one_article_create_one_row(
         assert indicators[0].indicator_value == "8.8.8.8"
 
 
-def test_same_ioc_in_different_articles_is_stored_per_article(
+def test_same_ioc_in_different_articles_is_shared_canonically(
     sqlite_session_factory: sessionmaker[Session],
 ) -> None:
     manager = FeedManager(session_factory=sqlite_session_factory)
@@ -194,8 +200,9 @@ def test_same_ioc_in_different_articles_is_stored_per_article(
             )
             .all()
         )
-        assert len(indicators) == 2
-        assert indicators[0].raw_article_id != indicators[1].raw_article_id
+        assert len(indicators) == 1
+        assert len(indicators[0].articles) == 2
+        assert session.query(ArticleIndicator).count() == 2
 
 
 def test_indicators_reference_their_source_article(
@@ -221,12 +228,10 @@ def test_indicators_reference_their_source_article(
 
     with sqlite_session_factory() as session:
         raw_article = session.query(RawArticle).filter(RawArticle.url == article.url).one()
-        indicator = (
-            session.query(Indicator).filter(Indicator.raw_article_id == raw_article.id).one()
-        )
+        indicator = raw_article.indicators[0]
 
-        assert indicator.raw_article_id == raw_article.id
-        assert indicator.raw_article.id == raw_article.id
+        assert indicator.articles[0].id == raw_article.id
+        assert raw_article.indicators[0].id == indicator.id
 
 
 def test_scheduler_builds_beat_schedule() -> None:

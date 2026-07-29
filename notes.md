@@ -1,4 +1,105 @@
-# ThreatLens Phase 5 Verification Notes
+# ThreatLens Canonical Indicator Repair Verification Notes
+
+## Canonical indicator repair work log
+
+Pre-edit inspection found:
+
+- Active ownership was `RawArticle -> Indicator` with `delete-orphan`; every indicator
+  carried a non-null `raw_article_id`.
+- The actual uniqueness rule was
+  `(raw_article_id, indicator_type, indicator_value)`, so identical values in different
+  articles intentionally received different IDs.
+- Extraction normalizes CVEs to uppercase, hashes/domains/emails to lowercase, IPv4
+  and IPv6 through Python's `ipaddress` canonical form, and leaves validated HTTP(S)
+  URLs in their existing exact representation.
+- Current enrichment upserts conflict on `(indicator_id, provider)`. EPSS history
+  conflicts on `(indicator_id, model_date)`.
+- `indicator_enrichments.indicator_id` and `epss_history.indicator_id` are the only
+  active foreign keys referencing `indicators`.
+- Migration risks are provider-row collisions after ID repointing, EPSS same-date
+  collisions, accidental cascade deletion, invalid legacy values, and the inherently
+  lossy downgrade from many article mentions back to one `raw_article_id`.
+
+The repair uses `(indicator_type, indicator_value)` as the canonical identity after
+applying the existing safe normalization rules. Invalid legacy values are preserved
+verbatim instead of being cast or rejected during migration, so they cannot abort the
+upgrade or be silently merged.
+
+## Canonical repair checks actually run
+
+Changed-file formatting:
+
+```bash
+ruff format --check \
+  backend/app/ingestion/models.py \
+  backend/app/ingestion/feed_manager.py \
+  backend/app/ingestion/ioc/persistence.py \
+  backend/app/ingestion/enrichment/tasks.py \
+  backend/app/models/indicator.py \
+  backend/tests/test_ioc_enrichment.py \
+  backend/tests/test_phase5_enrichment.py \
+  backend/tests/test_ingestion.py \
+  backend/tests/test_canonical_indicators.py \
+  alembic/versions/20260729_canonical_indicators.py
+```
+
+Expected and observed output:
+
+```text
+10 files already formatted
+```
+
+The repository-wide formatting command was also attempted. It reported only:
+
+```text
+Would reformat: backend/app/ingestion/rss_client.py
+1 file would be reformatted, 71 files already formatted
+```
+
+That unrelated pre-existing file was deliberately not modified.
+
+Repository-wide Ruff, Mypy, tests, compilation, migration head, Compose, and diff:
+
+```bash
+ruff check backend/app backend/tests alembic/versions
+mypy backend
+pytest -q
+python -m compileall -q backend/app alembic/versions
+alembic heads
+docker compose config -q
+git diff --check
+```
+
+Expected and observed significant output:
+
+```text
+All checks passed!
+Success: no issues found in 65 source files
+77 passed
+b74f3c9a21de (head)
+```
+
+The final three commands other than `alembic heads` produce no output on success.
+
+The migration was also tested against a separate disposable PostgreSQL 16 database
+populated at revision `61b739ac42e5` with three articles, four old indicator rows,
+conflicting NVD/KEV/EPSS statuses, and duplicate same-date EPSS history. Upgrade
+produced these exact counts:
+
+```text
+canonical_indicators = 2
+mentions             = 4
+provider_rows        = 3
+history_rows         = 1
+orphan_count         = 0
+```
+
+`CVE-2026-15409` became one canonical row with three article associations. The retained
+provider rows were NVD success, KEV successful negative, and EPSS success; newer
+failure/rate-limit rows did not replace successes. The newest same-date EPSS observation
+(`0.2000000`, percentile `0.6000000`) won. Downgrade to `61b739ac42e5` and re-upgrade
+to head both completed successfully; as documented, downgrade necessarily loses
+additional article associations.
 
 Run the commands below from the repository root:
 
@@ -57,7 +158,7 @@ mypy backend
 Expected output:
 
 ```text
-Success: no issues found in 64 source files
+Success: no issues found in 65 source files
 ```
 
 ## 4. Compile the Python sources
@@ -112,7 +213,7 @@ Expected output:
 
 ```text
 ......................................................................   [100%]
-71 passed
+77 passed
 ```
 
 The health test uses HTTPX's in-process ASGI transport because FastAPI's blocking
@@ -127,7 +228,7 @@ alembic heads
 Expected output:
 
 ```text
-61b739ac42e5 (head)
+b74f3c9a21de (head)
 ```
 
 To inspect the complete chain:
@@ -139,9 +240,9 @@ alembic history --verbose
 The first revision in the output should be:
 
 ```text
-Rev: 61b739ac42e5 (head)
-Parent: 8c31f1e782b4
-Path: .../alembic/versions/20260729_phase5_epss_history.py
+Rev: b74f3c9a21de (head)
+Parent: 61b739ac42e5
+Path: .../alembic/versions/20260729_canonical_indicators.py
 ```
 
 Apply the migration to a configured PostgreSQL database with:
@@ -153,11 +254,13 @@ alembic upgrade head
 Expected successful final line:
 
 ```text
-Running upgrade 8c31f1e782b4 -> 61b739ac42e5, Add Phase 5 error codes and EPSS history.
+Running upgrade 61b739ac42e5 -> b74f3c9a21de, Canonicalize indicators and preserve article mentions in an association table.
 ```
 
-The migration was applied successfully to the local Docker PostgreSQL service. Its downgrade SQL
-was also generated offline and inspected without deleting the live EPSS observations.
+The migration was applied only to the separate disposable
+`threatlens_canonical_test` database. It was intentionally not applied to the populated
+ThreatLens database. Downgrade and re-upgrade were both executed on that disposable
+fixture.
 
 ## 8. Check the final diff
 
