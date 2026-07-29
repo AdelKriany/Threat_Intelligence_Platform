@@ -84,6 +84,8 @@ def test_nvd_is_enabled_without_api_key_from_worker_environment(
     monkeypatch.setenv("NVD_API_KEY", "")
     monkeypatch.setenv("ABUSEIPDB_ENABLED", "false")
     monkeypatch.setenv("VIRUSTOTAL_ENABLED", "false")
+    monkeypatch.setenv("CISA_KEV_ENABLED", "false")
+    monkeypatch.setenv("EPSS_ENABLED", "false")
 
     config = Settings()
     registry = ProviderRegistry.from_settings(config)
@@ -309,7 +311,7 @@ def test_partial_provider_failure_is_persisted(
 
         assert {result.status for result in results} == {
             EnrichmentStatus.SUCCESS,
-            EnrichmentStatus.FAILED,
+            EnrichmentStatus.TEMPORARY_FAILURE,
         }
         assert session.query(IndicatorEnrichment).count() == 2
 
@@ -504,7 +506,7 @@ def test_celery_single_indicator_task_uses_id_and_closes_session(
             state["closed"] = True
 
     class FakeService:
-        def __init__(self, session: object) -> None:
+        def __init__(self, session: object, **kwargs: object) -> None:
             assert isinstance(session, FakeSession)
 
         async def enrich_indicator(
@@ -546,7 +548,7 @@ def test_celery_single_indicator_task_closes_session_on_failure(
             state["closed"] = True
 
     class FailedService:
-        def __init__(self, session: object) -> None:
+        def __init__(self, session: object, **kwargs: object) -> None:
             assert isinstance(session, FakeSession)
 
         async def enrich_indicator(

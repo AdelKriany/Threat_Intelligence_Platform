@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -145,6 +148,12 @@ class Indicator(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    epss_history: Mapped[list[EPSSHistory]] = relationship(
+        "EPSSHistory",
+        back_populates="indicator",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class IndicatorEnrichment(Base):
@@ -180,6 +189,7 @@ class IndicatorEnrichment(Base):
         nullable=True,
     )
     error_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     enriched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
@@ -192,3 +202,32 @@ class IndicatorEnrichment(Base):
     )
 
     indicator: Mapped[Indicator] = relationship("Indicator", back_populates="enrichments")
+
+
+class EPSSHistory(Base):
+    """Daily, precise EPSS observations used for future trend analysis."""
+
+    __tablename__ = "epss_history"
+    __table_args__ = (
+        UniqueConstraint(
+            "indicator_id",
+            "model_date",
+            name="uq_epss_history_indicator_model_date",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    indicator_id: Mapped[int] = mapped_column(
+        ForeignKey("indicators.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    epss: Mapped[Decimal] = mapped_column(Numeric(8, 7), nullable=False)
+    percentile: Mapped[Decimal] = mapped_column(Numeric(8, 7), nullable=False)
+    model_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    indicator: Mapped[Indicator] = relationship("Indicator", back_populates="epss_history")

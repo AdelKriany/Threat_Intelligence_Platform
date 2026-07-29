@@ -5,6 +5,8 @@ from typing import Any, cast
 
 import httpx
 
+from app.ingestion.enrichment.cache import AsyncJSONCache
+from app.ingestion.enrichment.exceptions import ProviderTemporaryError
 from app.ingestion.enrichment.providers.base import EnrichmentProvider
 from app.ingestion.enrichment.types import EnrichmentResult, EnrichmentStatus
 from app.ingestion.models import IOCType
@@ -22,21 +24,59 @@ class NVDProvider(EnrichmentProvider):
         api_key: str | None = None,
         timeout: float = 10.0,
         max_retries: int = 2,
+        ttl_seconds: int = 86400,
+        max_retry_delay_seconds: float = 60.0,
         client: httpx.AsyncClient | None = None,
+        sleep: Any = None,
+        cache: AsyncJSONCache | None = None,
     ) -> None:
-        super().__init__(enabled=enabled, timeout=timeout, max_retries=max_retries, client=client)
+        super().__init__(
+            enabled=enabled,
+            timeout=timeout,
+            max_retries=max_retries,
+            client=client,
+            ttl_seconds=ttl_seconds,
+            max_retry_delay_seconds=max_retry_delay_seconds,
+            **({"sleep": sleep} if sleep is not None else {}),
+        )
         self._api_key = api_key
+        self.cache = cache
 
     async def enrich(
         self, indicator_id: int, indicator_value: str, ioc_type: IOCType
     ) -> EnrichmentResult:
-        headers = {"apiKey": self._api_key} if self._api_key else None
-        payload = await self._get_json(
-            self.api_url,
-            headers=headers,
-            params={"cveId": indicator_value},
-        )
-        return self.normalize(indicator_id, indicator_value, ioc_type, payload)
+        cache_key = f"nvd:cve:{indicator_value.upper()}:v1"
+        if self.cache is not None:
+            cached = await self.cache.get_json(cache_key)
+            if cached is not None:
+                return self.normalize(indicator_id, indicator_value, ioc_type, cached)
+            token = await self.cache.acquire_lock(cache_key, 120)
+            if token is None:
+                for _ in range(5):
+                    await self._sleep(0.2)
+                    cached = await self.cache.get_json(cache_key)
+                    if cached is not None:
+                        return self.normalize(indicator_id, indicator_value, ioc_type, cached)
+                raise ProviderTemporaryError("NVD refresh is already in progress")
+        else:
+            token = None
+        try:
+            if self.cache is not None:
+                cached = await self.cache.get_json(cache_key)
+                if cached is not None:
+                    return self.normalize(indicator_id, indicator_value, ioc_type, cached)
+            headers = {"apiKey": self._api_key} if self._api_key else None
+            payload = await self._get_json(
+                self.api_url,
+                headers=headers,
+                params={"cveId": indicator_value},
+            )
+            if self.cache is not None:
+                await self.cache.set_json(cache_key, payload, self.ttl_seconds)
+            return self.normalize(indicator_id, indicator_value, ioc_type, payload)
+        finally:
+            if self.cache is not None and token is not None:
+                await self.cache.release_lock(cache_key, token)
 
     def normalize(
         self,

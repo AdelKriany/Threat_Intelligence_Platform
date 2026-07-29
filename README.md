@@ -201,3 +201,10 @@ credential-free template. Compose interpolation occurs when containers are creat
 lookups with stricter rate limits. AbuseIPDB and VirusTotal should remain disabled when their API
 keys are absent. See the architecture documentation for safe single-indicator and five-item
 NVD-only backfill commands.
+
+Phase 5 adds CISA KEV and FIRST EPSS to NVD for CVE enrichment. KEV provides confirmed active
+exploitation, EPSS provides a 0–1 probability of exploitation in the next 30 days, and NVD
+provides severity and vulnerability metadata. These remain separate provider observations;
+Phase 6 combined risk scoring is not implemented. See the
+[Phase 5 architecture](docs/architecture.md#phase-5-cve-enrichment) for configuration, bounded
+tasks, retry behavior, and coverage queries.

@@ -14,6 +14,8 @@ class EnrichmentStatus(StrEnum):
     FAILED = "failed"
     RATE_LIMITED = "rate_limited"
     AUTH_ERROR = "auth_error"
+    TEMPORARY_FAILURE = "temporary_failure"
+    PERMANENT_FAILURE = "permanent_failure"
 
 
 @dataclass(slots=True)
@@ -33,4 +35,5 @@ class EnrichmentResult:
     enriched_at: datetime | None = None
     expires_at: datetime | None = None
     error_message: str | None = None
+    error_code: str | None = None
     cached: bool = False

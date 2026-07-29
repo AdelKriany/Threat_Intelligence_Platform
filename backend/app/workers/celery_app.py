@@ -29,6 +29,23 @@ def configure_beat_schedule() -> None:
         celery_app.conf.beat_schedule["refresh-expired-enrichments"] = {
             "task": "app.ingestion.enrichment.tasks.enrich_pending_batch_task",
             "schedule": settings.enrichment_refresh_interval_minutes * 60,
+            "args": (settings.enrichment_batch_size, "nvd"),
+        }
+        if settings.cisa_kev_enabled:
+            celery_app.conf.beat_schedule["refresh-cisa-kev"] = {
+                "task": "app.ingestion.enrichment.tasks.refresh_kev_catalog_task",
+                "schedule": settings.cisa_kev_refresh_interval_minutes * 60,
+                "args": (settings.enrichment_batch_size, True),
+            }
+        if settings.epss_enabled:
+            celery_app.conf.beat_schedule["refresh-epss"] = {
+                "task": "app.ingestion.enrichment.tasks.refresh_epss_batch_task",
+                "schedule": settings.epss_refresh_interval_minutes * 60,
+                "args": (settings.enrichment_batch_size,),
+            }
+        celery_app.conf.beat_schedule["phase5-coverage"] = {
+            "task": "app.ingestion.enrichment.tasks.phase5_coverage_task",
+            "schedule": 86400,
         }
 
 

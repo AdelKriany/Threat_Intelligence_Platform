@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
@@ -30,11 +31,17 @@ class EnrichmentProvider(ABC):
         timeout: float,
         max_retries: int,
         client: httpx.AsyncClient | None = None,
+        ttl_seconds: int = 86400,
+        max_retry_delay_seconds: float = 60.0,
+        sleep: Any = asyncio.sleep,
     ) -> None:
         self._enabled = enabled
         self.timeout = timeout
         self.max_retries = max(0, max_retries)
         self._client = client
+        self.ttl_seconds = ttl_seconds
+        self.max_retry_delay_seconds = max_retry_delay_seconds
+        self._sleep = sleep
 
     @property
     def enabled(self) -> bool:
@@ -65,6 +72,7 @@ class EnrichmentProvider(ABC):
         *,
         headers: dict[str, str] | None = None,
         params: dict[str, str | int] | None = None,
+        expected_content_types: tuple[str, ...] = ("application/json",),
     ) -> dict[str, Any]:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -81,17 +89,29 @@ class EnrichmentProvider(ABC):
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = exc
                 if attempt < self.max_retries:
-                    await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
+                    await self._sleep(self._backoff(attempt))
                     continue
                 raise ProviderTemporaryError("provider request timed out or failed") from exc
 
             if response.status_code in {401, 403}:
                 raise ProviderAuthenticationError("provider authentication was rejected")
             if response.status_code == 429:
-                raise ProviderRateLimitError("provider rate limit exceeded")
+                retry_after = self._retry_after(response)
+                if attempt < self.max_retries:
+                    await self._sleep(
+                        min(
+                            retry_after if retry_after is not None else self._backoff(attempt),
+                            self.max_retry_delay_seconds,
+                        )
+                    )
+                    continue
+                raise ProviderRateLimitError(
+                    "provider rate limit exceeded",
+                    retry_after=retry_after,
+                )
             if 500 <= response.status_code:
                 if attempt < self.max_retries:
-                    await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
+                    await self._sleep(self._backoff(attempt))
                     continue
                 raise ProviderTemporaryError(f"provider unavailable (HTTP {response.status_code})")
             if response.status_code == 404:
@@ -100,6 +120,12 @@ class EnrichmentProvider(ABC):
                 raise ProviderResponseError(
                     f"provider rejected request (HTTP {response.status_code})"
                 )
+
+            content_type = response.headers.get("content-type", "").lower()
+            if expected_content_types and not any(
+                expected in content_type for expected in expected_content_types
+            ):
+                raise ProviderResponseError("provider returned an unexpected content type")
 
             content_length = response.headers.get("content-length")
             if content_length:
@@ -119,3 +145,17 @@ class EnrichmentProvider(ABC):
             return payload
 
         raise ProviderTemporaryError("provider request failed") from last_error
+
+    def _backoff(self, attempt: int) -> float:
+        base = min(0.5 * (2**attempt), self.max_retry_delay_seconds)
+        return min(base + random.uniform(0, base * 0.25), self.max_retry_delay_seconds)
+
+    @staticmethod
+    def _retry_after(response: httpx.Response) -> float | None:
+        value = response.headers.get("retry-after")
+        if value is None:
+            return None
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            return None

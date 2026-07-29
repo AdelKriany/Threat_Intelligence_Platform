@@ -1,18 +1,24 @@
 class EnrichmentError(Exception):
     """Base exception safe for conversion into a controlled failure result."""
 
+    error_code = "enrichment_error"
+
 
 class ProviderAuthenticationError(EnrichmentError):
-    pass
+    error_code = "authentication_error"
 
 
 class ProviderRateLimitError(EnrichmentError):
-    pass
+    error_code = "rate_limited"
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class ProviderTemporaryError(EnrichmentError):
-    pass
+    error_code = "temporary_failure"
 
 
 class ProviderResponseError(EnrichmentError):
-    pass
+    error_code = "invalid_response"

@@ -131,3 +131,101 @@ are never logged. Retries are bounded, authentication failures are permanent, 42
 recorded without tight retry loops, and payload/error sizes are limited. Anonymous NVD access
 omits the API-key header and is subject to stricter provider rate limits. AbuseIPDB and
 VirusTotal remain disabled unless both their provider flag and credential are configured.
+
+## Phase 5 CVE enrichment
+
+Phase 5 gives every CVE up to three independent current enrichment rows:
+
+| Provider | Signal | Retrieval pattern | Default refresh |
+| --- | --- | --- | --- |
+| NVD | CVSS and vulnerability metadata | Value-keyed Redis response cache plus PostgreSQL TTL | Hourly bounded scan |
+| CISA KEV | Confirmed exploitation | One shared catalog download, Redis cache and lock | Every 6 hours |
+| FIRST EPSS | 30-day exploitation probability | CVE batches of at most 100 | Daily |
+
+The authoritative sources are the
+[CISA KEV JSON catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) and
+[FIRST EPSS API](https://www.first.org/epss/api). Each provider is isolated: failure in one does
+not prevent the others from persisting results.
+
+KEV absence is a successful negative observation with `known_exploited=false`, not an error.
+EPSS `epss` and `percentile` are probabilities in the inclusive range 0–1. Current JSON stores
+their exact decimal text, while `epss_history` stores precise `NUMERIC(8,7)` daily observations.
+Phase 5 does not combine CVSS, KEV, or EPSS into a ThreatLens risk score.
+
+### Status and retry policy
+
+| Status | Meaning | Default policy |
+| --- | --- | --- |
+| `success` | Valid result, including KEV negative results | Provider TTL |
+| `not_found` | No provider record for a valid CVE | 6-hour negative cache |
+| `rate_limited` | HTTP 429 | Retry after 15 minutes |
+| `temporary_failure` | Timeout, network, or exhausted 5xx retries | Retry after 15 minutes |
+| `permanent_failure` | Invalid input, authentication, or invalid response | No tight retry loop |
+
+Legacy `failed` and `auth_error` rows remain readable. Pending selection applies short retry
+policies to old `rate_limited`/`failed` rows even when they originally received a 24-hour expiry.
+Retries use exponential backoff with jitter, honor bounded `Retry-After`, and never store keys or
+authorization headers.
+
+Redis keys use the `threatlens:enrichment` namespace. NVD responses are cached by normalized CVE
+value so article-scoped duplicate indicators do not repeat upstream requests. Token-checked locks
+prevent duplicate NVD/KEV downloads and overlapping periodic batches. Redis failure is logged and
+fails open so it cannot corrupt or block PostgreSQL persistence.
+
+### Phase 5 tasks and operations
+
+```text
+app.ingestion.enrichment.tasks.enrich_indicator_task
+app.ingestion.enrichment.tasks.enrich_pending_batch_task
+app.ingestion.enrichment.tasks.refresh_kev_catalog_task
+app.ingestion.enrichment.tasks.refresh_epss_batch_task
+app.ingestion.enrichment.tasks.phase5_coverage_task
+```
+
+Safely verify at most three CVEs, one provider at a time:
+
+```bash
+docker compose exec -T celery-worker celery -A app.workers.celery_app call \
+  app.ingestion.enrichment.tasks.enrich_pending_batch_task --args='[3,"nvd"]'
+
+docker compose exec -T celery-worker celery -A app.workers.celery_app call \
+  app.ingestion.enrichment.tasks.refresh_kev_catalog_task --args='[3,true]'
+
+docker compose exec -T celery-worker celery -A app.workers.celery_app call \
+  app.ingestion.enrichment.tasks.refresh_epss_batch_task --args='[3]'
+```
+
+Inspect coverage without raw responses:
+
+```sql
+SELECT provider, status, COUNT(*)
+FROM indicator_enrichments
+GROUP BY provider, status
+ORDER BY provider, status;
+
+SELECT provider, COUNT(DISTINCT indicator_id) AS covered_cves
+FROM indicator_enrichments
+WHERE provider IN ('nvd', 'cisa_kev', 'epss') AND status = 'success'
+GROUP BY provider;
+
+SELECT COUNT(*) AS known_exploited
+FROM indicator_enrichments
+WHERE provider = 'cisa_kev'
+  AND status = 'success'
+  AND normalized_data->>'known_exploited' = 'true';
+
+SELECT provider, COUNT(*) AS stale
+FROM indicator_enrichments
+WHERE expires_at <= now()
+GROUP BY provider;
+```
+
+Phase 5 adds `CISA_KEV_ENABLED`, `CISA_KEV_CATALOG_URL`, `CISA_KEV_TTL_SECONDS`,
+`CISA_KEV_REFRESH_INTERVAL_MINUTES`, `EPSS_ENABLED`, `EPSS_API_URL`, `EPSS_BATCH_SIZE`,
+`EPSS_TTL_SECONDS`, `EPSS_REFRESH_INTERVAL_MINUTES`,
+`ENRICHMENT_RATE_LIMIT_RETRY_SECONDS`, `ENRICHMENT_NOT_FOUND_TTL_SECONDS`,
+`ENRICHMENT_FAILURE_RETRY_SECONDS`, and `ENRICHMENT_RETRY_MAX_DELAY_SECONDS`.
+
+Compose passes these to API, worker, and Beat. `.env.example` contains safe defaults only; real
+secrets remain in `.env` or deployment secrets. Apply migrations and recreate application
+containers after changing Phase 5 settings.
