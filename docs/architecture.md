@@ -2,6 +2,97 @@
 
 This directory holds conceptual documentation for the Phase 1 foundation.
 
+## Phase 6A IOC quality and read-only audit
+
+`app.ingestion.ioc.validators.validate_indicator()` is the canonical network-free
+validation engine used by extraction, persistence, providers that normalize CVEs, and
+the database audit. It returns an immutable result containing the original and
+normalized values, IOC type, `valid`/`invalid`/`suspicious` status, and a stable reason
+code. `normalize_indicator()` remains the compatibility API and returns normalized
+values for both valid and suspicious results.
+
+Parseable non-public IP addresses are `suspicious`, not invalid. This preserves the
+existing ability to record private infrastructure while making loopback, private,
+reserved, unspecified, link-local, and multicast use explicit and auditable.
+
+Domain validation uses label, length, character, IDNA, and plausible-suffix checks.
+The `domain_file_extension` policy rejects bare names ending in common web, document,
+archive, executable, and image extensions. This is intentionally conservative for
+OSINT article extraction: a technically registerable name can resemble a filename, but
+accepting article titles such as `malwares.jpg` creates substantially more dangerous
+false intelligence. URLs are evaluated independently, so a path such as
+`https://example.com/payload.exe` remains valid.
+
+Run the read-only audit locally:
+
+```bash
+python -m app.ingestion.ioc.audit --format summary --sample-limit 5
+python -m app.ingestion.ioc.audit --format json --sample-limit 5
+```
+
+Or through the API service image:
+
+```bash
+docker compose exec -T api \
+  python -m app.ingestion.ioc.audit --format summary --sample-limit 5
+```
+
+The default exits zero even when questionable data exists. CI can use
+`--fail-on invalid`, `--fail-on suspicious`, or `--fail-on any`; policy findings then
+exit 1, while operational failures exit 2. The query is ordered and streamed in
+bounded batches. It selects only indicator IDs, types, and values and performs no
+updates, deletes, commits, enrichment reads, or network calls. Cleanup must be designed
+as a separate reviewed migration after the report is approved.
+
+The older `app.enrichment` package remains active as a candidate-generation
+compatibility layer. Its public extraction helpers now delegate final acceptance and
+normalization to the canonical validator, preventing rule drift without breaking
+callers.
+
+### Reviewed IOC cleanup
+
+`app.ingestion.ioc.cleanup` is a maintenance command rather than an Alembic data
+migration. Cleanup decisions depend on a specific reviewed audit and the current
+validator, so embedding mutable policy or hundreds of production IDs in schema history
+would be unsafe. No schema change is needed.
+
+Apply mode requires an expected count, a full-sample audit, and its SHA-256 file. It
+compares the complete current candidate set with the manifest, locks every candidate,
+revalidates type/value/status/reason, counts dependencies, and explicitly deletes EPSS
+history, enrichment rows, article associations, then indicators in one transaction.
+Any mismatch rolls everything back. Suspicious and valid indicators are never cleanup
+candidates.
+
+```bash
+python -m app.ingestion.ioc.cleanup --dry-run \
+  --expected-count 635 \
+  --audit-file reviewed-audit.json \
+  --audit-sha256 reviewed-audit.json.sha256
+
+python -m app.ingestion.ioc.cleanup --apply \
+  --expected-count 635 \
+  --audit-file reviewed-audit.json \
+  --audit-sha256 reviewed-audit.json.sha256
+```
+
+Before apply, stop `api`, `celery-worker`, and `celery-beat` without clearing queues,
+and create a verified custom-format PostgreSQL backup. Recovery is intentionally
+database restore, because no archive schema or fake Alembic downgrade can reliably
+reconstruct deleted canonical rows and relationships:
+
+```bash
+docker compose exec -T postgres pg_restore --list \
+  < backups/threatlens-before-ioc-cleanup-TIMESTAMP.dump
+docker compose exec -T postgres createdb -U threatlens threatlens_recovery
+docker compose exec -T postgres pg_restore -U threatlens -d threatlens_recovery \
+  --no-owner --no-privileges \
+  < backups/threatlens-before-ioc-cleanup-TIMESTAMP.dump
+```
+
+After review and cleanup, rerun both audit formats, orphan queries, health checks, and
+the full test suite before restarting only the paused services. Generated backups and
+timestamped audits are ignored by Git.
+
 ## Canonical indicators and article mentions
 
 Before revision `b74f3c9a21de`, each extracted IOC belonged directly to one article.

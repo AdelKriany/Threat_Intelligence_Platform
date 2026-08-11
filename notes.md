@@ -448,3 +448,198 @@ Expected shape:
 
 Exact rows depend on the enabled providers, current upstream data, and extracted CVEs.
 Phase 5 does not calculate a combined risk score; that remains Phase 6 work.
+
+## Phase 6A IOC quality and read-only audit
+
+Narrow tests were run first:
+
+```bash
+pytest -q \
+  backend/tests/test_ioc_validation.py \
+  backend/tests/test_ioc_extraction.py \
+  backend/tests/test_enrichment.py
+```
+
+Expected and observed output:
+
+```text
+53 passed
+```
+
+Repository-wide verification:
+
+```bash
+ruff check backend/app backend/tests alembic/versions
+mypy backend
+pytest -q
+```
+
+Expected and observed output:
+
+```text
+All checks passed!
+Success: no issues found in 67 source files
+120 passed
+```
+
+Read-only database audit commands:
+
+```bash
+docker compose exec -T api \
+  python -m app.ingestion.ioc.audit --format summary --sample-limit 3
+docker compose exec -T api \
+  python -m app.ingestion.ioc.audit --format json --sample-limit 1
+```
+
+Observed summary on 2026-08-09:
+
+```text
+total=1753 valid=1133 invalid=619 suspicious=1
+invalid type=domain reason=domain_file_extension count=619
+  id=19 value=11-old-microsoft-signed-linux-uefi.html
+  id=20 value=148-npm-packages-disguised-as-student.html
+  id=21 value=20-hijacked-government-websites.html
+suspicious type=ipv4 reason=ip_non_public count=1
+  id=23809 value=127.0.0.1
+```
+
+The audit selected only indicator IDs, types, and values. It did not update, delete, or
+commit database records. Default exit status was zero despite findings. Cleanup remains
+a separate migration requiring review.
+
+Health verification inside the API container:
+
+```bash
+docker compose exec -T api python -c \
+  "import urllib.request; response=urllib.request.urlopen(\
+'http://127.0.0.1:8000/api/v1/health', timeout=5); \
+print(response.status); print(response.read().decode())"
+```
+
+Observed output:
+
+```text
+200
+{"status":"ok"}
+```
+
+## Phase 6A reviewed IOC cleanup — 2026-08-11
+
+Architecture decision: use `app.ingestion.ioc.cleanup`, not an Alembic data migration.
+No schema change was required, and destructive policy remains bound to a checksum-
+verified reviewed audit rather than mutable historical migration behavior.
+
+### Verified backup
+
+PostgreSQL client and server were both `16.14`; Alembic was `b74f3c9a21de`.
+
+```bash
+docker compose exec -T postgres pg_dump \
+  -U threatlens -d threatlens \
+  --format=custom --no-owner --no-privileges \
+  > backups/threatlens-before-ioc-cleanup-20260811-081350.dump
+docker compose exec -T postgres pg_restore --list \
+  < backups/threatlens-before-ioc-cleanup-20260811-081350.dump
+sha256sum backups/threatlens-before-ioc-cleanup-20260811-081350.dump \
+  > backups/threatlens-before-ioc-cleanup-20260811-081350.dump.sha256
+```
+
+Observed:
+
+```text
+size=10159970 bytes
+sha256=52435114251dce89ce29452f33d113240f3378ff83b40063d60e47aa29b785a8
+pg_restore catalog entries=61
+```
+
+The dump was restored into isolated database
+`threatlens_ioc_cleanup_restore_20260811`. Live and restored counts matched exactly:
+
+```text
+indicators=1850 article_indicators=64490 indicator_enrichments=129
+epss_history=256 raw_articles=384
+```
+
+The isolated restore database was then removed.
+
+### Freeze and final reviewed audit
+
+Only `api`, `celery-worker`, and `celery-beat` were stopped. PostgreSQL and Redis stayed
+running; no queue was cleared.
+
+Final audit artifact:
+
+```text
+backups/phase6a-ioc-audit-20260811-081519.json
+sha256=96f65e971825f4acc25f51ef8f7c813176708ad9e4d6a525f32ab6be2c5155b1
+```
+
+Observed:
+
+```text
+total=1850 valid=1213 invalid=635 suspicious=2
+invalid/domain/domain_file_extension=635 (635 samples present)
+suspicious/ipv4/ip_non_public=1
+suspicious/ipv6/ip_non_public=1
+```
+
+### Dry run and apply
+
+The initial container dry run stopped before database access because the read-only bind
+mount lacked an SELinux label. It returned `PermissionError` and changed nothing. The
+correct mount is `:ro,z`.
+
+Dry-run output:
+
+```text
+mode=dry-run candidates=635 article_relationships=25687 enrichments=0 epss_history=0 indicators_deleted=0 article_relationships_deleted=0 enrichments_deleted=0 epss_history_deleted=0
+```
+
+Apply output:
+
+```text
+mode=apply candidates=635 article_relationships=25687 enrichments=0 epss_history=0 indicators_deleted=635 article_relationships_deleted=25687 enrichments_deleted=0 epss_history_deleted=0
+```
+
+### Post-cleanup verification
+
+Before restart:
+
+```text
+total=1215 valid=1213 invalid=0 suspicious=2
+indicators=1215 article_indicators=38803 indicator_enrichments=129
+epss_history=256 raw_articles=384
+article association orphans=0 enrichment orphans=0 EPSS orphans=0
+```
+
+After restarting only the three paused services, the final audit remained:
+
+```text
+total=1215 valid=1213 invalid=0 suspicious=2
+ipv4 suspicious: id=23809 value=127.0.0.1
+ipv6 suspicious: id=63886 value=::c
+```
+
+API health returned `200 {"status":"ok"}` and Celery reported one node online with all
+seven expected tasks registered.
+
+Final checks:
+
+```text
+focused cleanup/validator/extraction tests: 57 passed
+full test suite: 129 passed
+Ruff: All checks passed!
+Mypy: Success: no issues found in 69 source files
+compileall: exit 0
+docker compose config -q: exit 0
+Alembic: b74f3c9a21de (head)
+git diff --check: exit 0
+```
+
+The repository-wide format check still reports only the unrelated pre-existing
+`backend/app/ingestion/rss_client.py`; nine changed Python files are formatted.
+
+Recovery procedure: stop application writers, restore the verified custom-format dump
+into a new database first, validate its counts, then switch database configuration or
+restore the live database according to the deployment runbook. There is intentionally
+no fake Alembic downgrade for deleted data.

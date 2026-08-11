@@ -10,3 +10,7 @@ logs/
 *.egg-info/
 dist/
 build/
+backups/
+*.dump
+phase6a-ioc-audit*.json
+phase6a-ioc-audit*.json.sha256

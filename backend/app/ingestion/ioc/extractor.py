@@ -11,7 +11,7 @@ from app.enrichment.extractor import (
 )
 from app.ingestion.ioc.patterns import IOC_PATTERNS, IOCPattern
 from app.ingestion.ioc.types import ExtractedIndicator
-from app.ingestion.ioc.validators import normalize_indicator
+from app.ingestion.ioc.validators import ValidationStatus, validate_indicator
 from app.ingestion.models import IOCType, RawArticle
 
 _ENRICHMENT_EXTRACTORS: tuple[tuple[IOCType, Callable[[str], list[str]]], ...] = (
@@ -41,10 +41,13 @@ class IOCExtractionService:
         found: set[ExtractedIndicator] = set()
         for indicator_type, extractor in _ENRICHMENT_EXTRACTORS:
             for value in extractor(content):
+                validation = validate_indicator(indicator_type, value)
+                if validation.status is ValidationStatus.INVALID:
+                    continue
                 found.add(
                     ExtractedIndicator(
                         indicator_type=indicator_type,
-                        indicator_value=value,
+                        indicator_value=validation.normalized_value or value,
                     )
                 )
 
@@ -53,13 +56,13 @@ class IOCExtractionService:
             if pattern.indicator_type in _ENRICHMENT_TYPES:
                 continue
             for match in pattern.expression.finditer(content):
-                normalized = normalize_indicator(pattern.indicator_type, match.group(0))
-                if normalized is None:
+                validation = validate_indicator(pattern.indicator_type, match.group(0))
+                if validation.status is ValidationStatus.INVALID:
                     continue
                 found.add(
                     ExtractedIndicator(
                         indicator_type=pattern.indicator_type,
-                        indicator_value=normalized,
+                        indicator_value=validation.normalized_value or match.group(0),
                     )
                 )
 

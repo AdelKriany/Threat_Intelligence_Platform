@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import ipaddress
-import re
-from urllib.parse import urlparse
-
 from app.enrichment.regex import (
     CVE_PATTERN,
     EMAIL_PATTERN,
@@ -13,8 +9,8 @@ from app.enrichment.regex import (
     SHA256_PATTERN,
     URL_PATTERN,
 )
-
-_TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
+from app.ingestion.ioc.validators import normalize_indicator
+from app.ingestion.models import IOCType
 
 
 def _unique_in_order(values: list[str]) -> list[str]:
@@ -33,8 +29,8 @@ def extract_cves(text: str) -> list[str]:
 
     matches: list[str] = []
     for match in CVE_PATTERN.findall(text):
-        normalized = match.upper()
-        if re.fullmatch(r"CVE-(?:19|20)\d{2}-\d{4,7}", normalized):
+        normalized = normalize_indicator(IOCType.CVE, match)
+        if normalized is not None:
             matches.append(normalized)
     return _unique_in_order(matches)
 
@@ -44,10 +40,9 @@ def extract_ipv4(text: str) -> list[str]:
 
     matches: list[str] = []
     for candidate in IPV4_PATTERN.findall(text):
-        try:
-            matches.append(str(ipaddress.IPv4Address(candidate)))
-        except ipaddress.AddressValueError:
-            continue
+        normalized = normalize_indicator(IOCType.IPV4, candidate)
+        if normalized is not None:
+            matches.append(normalized)
     return _unique_in_order(matches)
 
 
@@ -56,13 +51,9 @@ def extract_urls(text: str) -> list[str]:
 
     matches: list[str] = []
     for raw_candidate in URL_PATTERN.findall(text):
-        candidate = raw_candidate.rstrip(_TRAILING_PUNCTUATION)
-        parsed = urlparse(candidate)
-        if parsed.scheme.lower() not in {"http", "https"}:
-            continue
-        if not parsed.netloc:
-            continue
-        matches.append(candidate)
+        normalized = normalize_indicator(IOCType.URL, raw_candidate)
+        if normalized is not None:
+            matches.append(normalized)
     return _unique_in_order(matches)
 
 
@@ -71,8 +62,8 @@ def extract_emails(text: str) -> list[str]:
 
     matches: list[str] = []
     for candidate in EMAIL_PATTERN.findall(text):
-        normalized = candidate.lower()
-        if re.fullmatch(EMAIL_PATTERN, normalized):
+        normalized = normalize_indicator(IOCType.EMAIL, candidate)
+        if normalized is not None:
             matches.append(normalized)
     return _unique_in_order(matches)
 
@@ -82,7 +73,7 @@ def extract_sha256(text: str) -> list[str]:
 
     matches: list[str] = []
     for candidate in SHA256_PATTERN.findall(text):
-        normalized = candidate.lower()
-        if re.fullmatch(r"[a-f0-9]{64}", normalized):
+        normalized = normalize_indicator(IOCType.SHA256, candidate)
+        if normalized is not None:
             matches.append(normalized)
     return _unique_in_order(matches)

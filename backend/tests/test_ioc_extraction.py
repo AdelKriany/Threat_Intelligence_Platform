@@ -72,6 +72,25 @@ def test_ioc_extractor_filters_invalid_candidates() -> None:
     assert indicators == []
 
 
+def test_ioc_extractor_rejects_filename_like_domain_candidates() -> None:
+    filenames = {
+        "malwares.jpg",
+        "mshta.exe",
+        "fastjson.gif",
+        "water-plant-attack.jpg",
+        "chrome-headless.jpg",
+        "notepad-malware-code.jpg",
+        "24650-internet-exposed-bmcs-disclose.html",
+        "zimbra-patches-critical-snmp-command.html",
+    }
+    extractor = IOCExtractionService()
+    indicators = extractor.extract(_build_raw_article(" ".join(filenames), url=None))
+    extracted_domains = {
+        item.indicator_value for item in indicators if item.indicator_type is IOCType.DOMAIN
+    }
+    assert extracted_domains.isdisjoint(filenames)
+
+
 def test_ioc_extractor_deduplicates_and_normalizes_values() -> None:
     sample_text = """
     cve-2026-7777 repeated as CVE-2026-7777.

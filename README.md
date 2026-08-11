@@ -175,6 +175,31 @@ Example:
 
 ## Development workflow
 
+### IOC quality audit
+
+Phase 6A uses `app.ingestion.ioc.validators.validate_indicator` as the shared,
+network-free IOC validation boundary. Audit existing canonical indicators without
+changing them:
+
+```bash
+python -m app.ingestion.ioc.audit --format summary --sample-limit 5
+docker compose exec -T api \
+  python -m app.ingestion.ioc.audit --format summary --sample-limit 5
+```
+
+The default audit is read-only and exits successfully even when invalid or suspicious
+records exist. Review the report before designing a separate cleanup migration.
+
+Reviewed cleanup is deliberately separate and defaults to dry-run:
+
+```bash
+python -m app.ingestion.ioc.cleanup --dry-run
+```
+
+Apply mode additionally requires the approved full-sample audit, its SHA-256 checksum,
+and the exact expected count. See `docs/architecture.md` for backup, writer-pause,
+apply, verification, and recovery procedures.
+
 - Format code with `black .`
 - Sort imports with `isort .`
 - Lint with `ruff check .`
