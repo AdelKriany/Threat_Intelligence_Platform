@@ -643,3 +643,178 @@ Recovery procedure: stop application writers, restore the verified custom-format
 into a new database first, validate its counts, then switch database configuration or
 restore the live database according to the deployment runbook. There is intentionally
 no fake Alembic downgrade for deleted data.
+
+## Phase 6B scoring-engine review fixes
+
+Run these commands from the repository root:
+
+```bash
+cd /home/adel/programming/osint_tool/Threat_Intelligence_Platform
+```
+
+The first focused run exposed the missing-component explanation defect:
+
+```bash
+pytest -q backend/tests/test_scoring_engine.py
+```
+
+Expected at that intermediate stage, and observed:
+
+```text
+1 failed, 96 passed
+```
+
+The failure was
+`test_no_evidence_is_zero_and_emits_fixed_cve_profile`: absent provider components
+did not explicitly say that evidence was missing. The implementation was corrected;
+the test was not weakened.
+
+An intermediate lint/type pass also found one import-order error, four files needing
+formatting, and four intentional float-rejection test inputs requiring type-checker
+annotations. After the first correction, Mypy found three annotations placed on the
+wrong lines. These were corrected before final verification.
+
+Final focused scoring and IOC-validator regression command:
+
+```bash
+pytest -q backend/tests/test_scoring_engine.py backend/tests/test_ioc_validation.py
+```
+
+Expected and observed output:
+
+```text
+........................................................................ [ 51%]
+....................................................................     [100%]
+140 passed in 0.77s
+```
+
+Final lint and formatting commands:
+
+```bash
+ruff check backend/app/scoring backend/tests/test_scoring_engine.py
+ruff format --check backend/app/scoring backend/tests/test_scoring_engine.py
+```
+
+Expected and observed output:
+
+```text
+All checks passed!
+6 files already formatted
+```
+
+Final static-type command:
+
+```bash
+mypy backend
+```
+
+Expected and observed output:
+
+```text
+Success: no issues found in 75 source files
+```
+
+Compilation command:
+
+```bash
+python -m compileall -q backend/app/scoring backend/tests/test_scoring_engine.py
+```
+
+Expected and observed output:
+
+```text
+```
+
+No output with exit status zero means compilation succeeded.
+
+Final full backend test command:
+
+```bash
+pytest -q
+```
+
+Expected and observed output:
+
+```text
+........................................................................ [ 31%]
+........................................................................ [ 63%]
+........................................................................ [ 95%]
+...........                                                              [100%]
+227 passed in 4.32s
+```
+
+Final pre-commit inspection commands:
+
+```bash
+git status --short
+git diff --check
+git diff -- backend/app/scoring backend/tests/test_scoring_engine.py
+```
+
+Expected output: status lists the untracked Phase 6B files and the modified
+`notes.md`; both diff commands exit successfully. Because the Phase 6B files are still
+untracked, ordinary `git diff` does not print their contents until they are staged.
+No files were staged and no commit was created. `docs/phase6b-spec.md` was read for
+clarification and left untouched.
+
+### Phase 6B specification reconciliation — 2026-08-17
+
+The scoring engine was reconciled with `docs/phase6b-spec.md`: suspicious or
+non-public validation status now has no scoring side effects. Non-public and globally
+routable IPs use the same independent-source formula, and usable provider evidence is
+weighted identically. Explicit provider expiry takes precedence over TTL-derived
+expiry. The result serializer is documented as derived-output serialization, not as
+the future persistence evidence-hash input.
+
+Focused scoring tests:
+
+```bash
+pytest -q backend/tests/test_scoring_engine.py
+```
+
+Expected and observed output:
+
+```text
+........................................................................ [ 66%]
+.....................................                                    [100%]
+109 passed in 0.62s
+```
+
+Full backend suite:
+
+```bash
+pytest -q
+```
+
+Expected and observed output:
+
+```text
+........................................................................ [ 30%]
+........................................................................ [ 60%]
+........................................................................ [ 90%]
+......................                                                   [100%]
+238 passed in 4.26s
+```
+
+Quality checks:
+
+```bash
+ruff check backend/app/scoring backend/tests/test_scoring_engine.py
+ruff format --check backend/app/scoring backend/tests/test_scoring_engine.py
+mypy backend
+python -m compileall -q backend/app/scoring backend/tests/test_scoring_engine.py
+git diff --check
+```
+
+Expected and observed significant output:
+
+```text
+All checks passed!
+6 files already formatted
+Success: no issues found in 75 source files
+```
+
+`compileall` and `git diff --check` produced no output and exited zero. The first
+format check identified two files requiring formatting; `ruff format` reformatted
+them, after which the final format check passed. No migration, persistence work,
+staging change, or commit was performed by Codex.
