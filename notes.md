@@ -818,3 +818,470 @@ Success: no issues found in 75 source files
 format check identified two files requiring formatting; `ruff format` reformatted
 them, after which the final format check passed. No migration, persistence work,
 staging change, or commit was performed by Codex.
+
+## Phase 6B persistence schema verification — 2026-08-17
+
+This increment adds only ORM mappings, one migration, and database-level tests for
+correlated-event links and explainable score history. Revision `c9f4e2a7b6d1` follows
+`b74f3c9a21de`. No scorer orchestration, correlation logic, hash service, API, CLI, or
+task was added.
+
+Focused portable model tests:
+
+```bash
+pytest -q backend/tests/test_phase6b_persistence.py
+```
+
+Expected and observed output:
+
+```text
+...................                                                      [100%]
+19 passed in 0.93s
+```
+
+The PostgreSQL-only test was run inside an ephemeral application container on the
+Compose network. The repository was mounted read-only and both `DATABASE_URL` and
+`PHASE6B_POSTGRES_URL` named only `threatlens_phase6b_test`:
+
+```bash
+python -m pytest -q -p no:cacheprovider \
+  backend/tests/test_phase6b_postgres_migration.py
+```
+
+Expected and observed output after the final test hardening:
+
+```text
+.                                                                        [100%]
+1 passed in 3.21s
+```
+
+That test reset only the safety-checked disposable database, upgraded from base to
+head, inspected the schema, exercised PostgreSQL checks/partial indexes/JSONB/Decimal/
+UTC/cascades, downgraded to `b74f3c9a21de`, verified prior tables remained, and
+re-upgraded to head. Separate Alembic CLI downgrade and re-upgrade commands were also
+executed against the same disposable database and reported:
+
+```text
+Running downgrade c9f4e2a7b6d1 -> b74f3c9a21de
+version_num = b74f3c9a21de
+prior tables retained: article_indicators, indicators, raw_articles
+Running upgrade b74f3c9a21de -> c9f4e2a7b6d1
+```
+
+Direct PostgreSQL catalog inspection found all five tables, 21 named constraints, and
+14 indexes including primary/unique indexes. `alembic check` reported:
+
+```text
+No new upgrade operations detected.
+```
+
+The final complete suite was run in the ephemeral container with the PostgreSQL-only
+test enabled:
+
+```bash
+python -m pytest -q -p no:cacheprovider
+```
+
+Expected and observed output:
+
+```text
+........................................................................ [ 27%]
+........................................................................ [ 55%]
+........................................................................ [ 83%]
+..........................................                               [100%]
+258 passed in 8.21s
+```
+
+Host quality commands:
+
+```bash
+ruff check backend/app backend/tests alembic/versions alembic/env.py
+ruff format --check \
+  alembic/env.py \
+  alembic/versions/20260817_phase6b_score_history.py \
+  backend/app/models/__init__.py \
+  backend/app/models/phase6b.py \
+  backend/tests/test_phase6b_persistence.py \
+  backend/tests/test_phase6b_postgres_migration.py
+mypy backend
+python -m compileall -q backend/app backend/tests alembic/versions
+git diff --check
+```
+
+Expected output:
+
+```text
+All checks passed!
+6 files already formatted
+Success: no issues found in 78 source files
+```
+
+`compileall` and `git diff --check` have no output on success. The repository-wide
+format check still identifies only the unrelated pre-existing
+`backend/app/ingestion/rss_client.py`; it was not modified. The disposable PostgreSQL
+database was dropped after verification. Real concurrent-transaction contention was
+not simulated; PostgreSQL uniqueness and rollback behavior were verified sequentially.
+
+## Phase 6B indicator-score orchestration — 2026-08-23
+
+This increment adds only synchronous indicator evidence loading, canonical evidence
+snapshot hashing, pure-engine invocation, append-only indicator score persistence, and
+focused tests. It does not add event scoring/correlation, an API, CLI, worker, schedule,
+trigger, backfill, migration, or schema change. Nothing was staged or committed, and
+the existing `engineDElete.txt` and `modelsDElete.txt` files were not touched.
+
+Created files:
+
+```text
+backend/app/scoring/evidence_snapshot.py
+backend/app/services/indicator_scoring.py
+backend/tests/test_indicator_scoring_service.py
+backend/tests/test_indicator_scoring_postgres.py
+```
+
+Public service interfaces:
+
+```python
+calculate_and_persist_indicator_score(session, indicator_id, *, as_of)
+load_indicator_scoring_evidence(session, indicator_id, *, as_of)
+latest_provider_records(records, provider_names)
+persist_indicator_score(session, *, indicator_id, score_result, snapshot)
+PersistedIndicatorScore(score_history, components, created, evidence_hash)
+IndicatorNotFoundError
+```
+
+Canonical-evidence interfaces:
+
+```python
+applicable_provider_names(ioc_type)
+build_canonical_evidence_payload(evidence, *, formula_version=...)
+canonical_serialize_evidence_payload(payload)
+build_evidence_snapshot(evidence, *, formula_version=...)
+CanonicalEvidenceSnapshot(canonical_bytes, evidence_hash)
+```
+
+The snapshot includes `formula_version`, `ioc_type`, `canonical_value`, normalized
+`as_of`, normalized `source_names`, and a fixed ordered `providers` list. Each provider
+entry contains `provider`, `status`, safe scoring `raw_input`, `evidence_at`, explicit
+`expires_at`, and `effective_expiry`. These fields identify the evidence and reproduce
+the freshness calculation. It excludes final/total score, severity, contribution,
+explanation, database IDs, insertion timestamps, component rows, and raw provider
+responses because those are derived output, storage identity, mutable data, or may
+contain secrets. SHA-256 is calculated over strict sorted compact UTF-8 JSON bytes;
+the logically identical decoded payload is stored in JSONB.
+
+Status mapping is explicit:
+
+```text
+success + valid normalized data -> usable
+success + invalid normalized data -> invalid
+not_found -> missing
+failed, rate_limited, auth_error, temporary_failure -> failed
+permanent_failure, invalid, unknown status -> invalid
+unsupported -> unsupported
+```
+
+Non-usable states carry no invented values or timestamps. Unsupported provider/IOC
+pairings are not loaded. The service performs three evidence queries for provider-
+backed IOC types (indicator, all applicable enrichments, all associated source names)
+and two for email (indicator and sources), with no per-provider or per-source loop.
+Latest provider selection is `enriched_at DESC, id DESC`.
+
+Persistence uses a nested transaction/savepoint and flushes without committing the
+caller's outer transaction. A pre-read permits fast reuse, while the PostgreSQL partial
+unique index `uq_score_history_indicator_evidence` is the concurrency authority. Only
+that exact uniqueness violation is treated as an idempotency race; the service then
+re-queries and returns the existing immutable row. Other integrity failures are
+re-raised. Components are reloaded with an explicit fixed-profile ordering rule.
+
+### Terminal commands and expected/observed output
+
+Focused orchestration and pure-engine tests:
+
+```bash
+pytest -q backend/tests/test_indicator_scoring_service.py
+pytest -q backend/tests/test_scoring_engine.py
+pytest -q backend/tests/test_phase6b_persistence.py
+```
+
+Expected and observed final output:
+
+```text
+47 passed in 1.42s
+109 passed in 0.84s
+19 passed in 0.95s
+```
+
+PostgreSQL was restricted by both environment variables to the safety-checked
+`threatlens_phase6b_test` database. The repository was mounted read-only; only a
+temporary log directory was writable and SELinux relabeled:
+
+```bash
+docker compose exec -T postgres dropdb --if-exists \
+  -U threatlens threatlens_phase6b_test
+docker compose exec -T postgres createdb \
+  -U threatlens threatlens_phase6b_test
+docker compose run --rm --no-deps -T --entrypoint sh -w /workspace \
+  -v /home/adel/programming/osint_tool/Threat_Intelligence_Platform:/workspace:ro \
+  -v /tmp/threatlens-phase6b-logs:/workspace/backend/logs:rw,z \
+  -e DATABASE_URL=postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens_phase6b_test \
+  -e PHASE6B_POSTGRES_URL=postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens_phase6b_test \
+  api -c '/app/.venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true; \
+  /app/.venv/bin/python -m pip install -q pytest; \
+  PYTHONPATH=/workspace/backend /app/.venv/bin/python -m pytest -q \
+  -p no:cacheprovider backend/tests/test_indicator_scoring_postgres.py \
+  backend/tests/test_phase6b_postgres_migration.py'
+```
+
+Expected and observed final focused PostgreSQL output:
+
+```text
+...                                                                      [100%]
+3 passed in 4.18s
+```
+
+This ran two real independent PostgreSQL sessions against the same snapshot. Both
+callers returned the same score-history ID/hash, exactly one caller reported creation,
+one history row and one email source component remained, no deadlock occurred, and
+both unrelated caller-created articles survived.
+
+Portable and PostgreSQL-enabled complete suites:
+
+```bash
+pytest -q
+```
+
+```text
+304 passed, 3 skipped in 6.04s
+```
+
+The complete container command is the preceding Compose command with no test paths:
+
+```bash
+PYTHONPATH=/workspace/backend /app/.venv/bin/python -m pytest -q \
+  -p no:cacheprovider
+```
+
+Expected and observed output:
+
+```text
+307 passed in 10.54s
+```
+
+Quality commands:
+
+```bash
+ruff check backend/app backend/tests alembic/versions alembic/env.py
+ruff format --check \
+  backend/app/scoring/evidence_snapshot.py \
+  backend/app/services/indicator_scoring.py \
+  backend/tests/test_indicator_scoring_service.py \
+  backend/tests/test_indicator_scoring_postgres.py
+mypy backend
+python -m compileall -q backend/app backend/tests alembic/versions
+git diff --check
+```
+
+Expected and observed significant output:
+
+```text
+All checks passed!
+4 files already formatted
+Success: no issues found in 82 source files
+```
+
+`compileall` and `git diff --check` produced no output and exited zero. The broader
+format check reported `90 files already formatted` and only the unrelated pre-existing
+`backend/app/ingestion/rss_client.py` as requiring formatting; it remains untouched.
+
+### Problems encountered during verification
+
+The first ephemeral-container attempt used its entrypoint/login-shell defaults, which
+selected system Python and failed collection with `ModuleNotFoundError: pydantic`.
+Using `/app/.venv/bin/python`, bypassing the entrypoint, and mounting the repository at
+the actual working directory fixed the environment.
+
+The first PostgreSQL rerun revealed that `alembic/env.py` replaces the URL supplied by
+`Config.set_main_option()` with the already-loaded application `settings.database_url`.
+Because the Compose service default was still present, its migration setup ran against
+the local Compose development database while test queries used the disposable database;
+the tests then failed with `relation "indicators" does not exist`. No production
+database was involved. A later authoritative isolation-fix baseline, supplied by the
+user and repeatedly verified read-only, is 60 raw articles, 456 indicators, 9,930
+article-indicator links, zero indicator enrichments, and zero EPSS history rows. These
+figures record current verified state only and do not establish the earlier incident's
+data impact.
+
+The existing migration lifecycle test initially failed after the scoring test because
+the committed source-less email fixture correctly blocked downgrade of the canonical
+indicator migration. The PostgreSQL scoring fixture now truncates only test rows from
+the safety-checked disposable database during teardown. Running both test modules
+together then passed. A complete-suite collection attempt also hit a permission error
+for `/workspace/backend/logs/threatlens.log`; adding `,z` to the narrow temporary bind
+mount fixed its SELinux label, after which all 307 tests passed.
+
+The disposable `threatlens_phase6b_test` database was dropped after final verification.
+
+## Phase 6B PostgreSQL isolation remediation — 2026-08-23
+
+The exact root cause was the unconditional statement in `alembic/env.py`:
+
+```python
+config.set_main_option("sqlalchemy.url", settings.database_url)
+```
+
+It executed after programmatic callers had configured their Alembic `Config`, replacing
+the intended disposable URL with the already-loaded Compose development URL. The fix
+resolves URLs in this order: programmatic `Config.attributes` URL, `-x database_url`
+CLI override, a non-placeholder `sqlalchemy.url`, then application settings fallback.
+Percent signs are doubled only while stored in ConfigParser so URL-encoded passwords
+round-trip without interpolation errors. Offline and online migrations consume the
+same resolved value.
+
+The shared PostgreSQL safety layer now:
+
+* accepts only PostgreSQL database name `threatlens_phase6b_test` exactly;
+* rejects missing/malformed URLs, SQLite, `threatlens`, `postgres`, templates, empty
+  names, and unrelated `_test` databases before engine creation or Alembic calls;
+* checks `SELECT current_database()` at DBAPI checkout and again immediately before
+  every guarded Alembic operation, truncation, and cleanup;
+* passes the expected database through Alembic Config so `env.py` checks the actual
+  migration connection before running DDL;
+* connects to exact administrative database `postgres`, verifies its identity, refuses
+  a pre-existing disposable database, creates one exact database, and immediately adds
+  a UUID ownership marker as its database comment;
+* terminates connections and drops only the exact disposable name after both target
+  identity and ownership marker match the current process;
+* performs no fallback deletion if creation or cleanup fails.
+
+An initial run of the new lifecycle created the exact disposable database but hit an
+autobegin conflict before recording its first table marker. After explicit approval,
+read-only checks showed the literal target, admin database `postgres`, no marker, zero
+public tables, and zero user relations. Zero active connections were terminated and
+only that literal database was dropped. Ownership marking was moved to an immediate
+database comment. A later guarded migration attempt showed that the identity query's
+read-only autobegin caused logged DDL to roll back; the guard now explicitly rolls back
+that read-only transaction before Alembic begins its migration transaction. The owned
+fixture cleaned up that failed disposable run itself.
+
+Connection-free safety validation was run before any PostgreSQL integration test:
+
+```bash
+pytest -q \
+  backend/tests/test_alembic_database_url.py \
+  backend/tests/test_postgres_test_safety.py
+ruff check \
+  alembic/env.py \
+  backend/app/database/alembic_runtime.py \
+  backend/app/database/postgres_test_safety.py \
+  backend/tests/conftest.py \
+  backend/tests/test_alembic_database_url.py \
+  backend/tests/test_postgres_test_safety.py \
+  backend/tests/test_indicator_scoring_postgres.py \
+  backend/tests/test_phase6b_postgres_migration.py
+mypy \
+  backend/app/database/alembic_runtime.py \
+  backend/app/database/postgres_test_safety.py \
+  backend/tests/conftest.py \
+  backend/tests/test_alembic_database_url.py \
+  backend/tests/test_postgres_test_safety.py \
+  backend/tests/test_indicator_scoring_postgres.py \
+  backend/tests/test_phase6b_postgres_migration.py
+```
+
+Expected and observed final output:
+
+```text
+24 passed in 0.07s
+All checks passed!
+Success: no issues found in 7 source files
+```
+
+Mocked sentinel tests prove a `threatlens` URL fails before engine creation or an
+Alembic command, an exact test URL redirected to a connection reporting `threatlens`
+fails before Alembic, an unrelated `_test` name fails the exact allowlist, missing and
+malformed URLs fail closed, and an unowned/pre-existing database is not claimed.
+
+Focused final tests:
+
+```bash
+pytest -q backend/tests/test_indicator_scoring_service.py
+pytest -q backend/tests/test_scoring_engine.py
+pytest -q backend/tests/test_phase6b_persistence.py
+```
+
+```text
+47 passed in 1.54s
+109 passed in 0.77s
+19 passed in 1.01s
+```
+
+Focused PostgreSQL migration and concurrency tests were run in the read-only-mounted
+Compose test container with both URLs naming only `threatlens_phase6b_test`. Database
+creation and removal were performed exclusively by the session fixture:
+
+```bash
+python -m pytest -q -p no:cacheprovider \
+  backend/tests/test_indicator_scoring_postgres.py \
+  backend/tests/test_phase6b_postgres_migration.py
+```
+
+```text
+3 passed in 3.51s
+```
+
+Complete suites:
+
+```bash
+pytest -q
+python -m pytest -q -p no:cacheprovider  # owned PostgreSQL container
+```
+
+```text
+328 passed, 3 skipped in 5.12s
+331 passed in 14.49s
+```
+
+Final quality checks:
+
+```bash
+ruff check backend/app backend/tests alembic/versions alembic/env.py
+ruff format --check \
+  alembic/env.py \
+  backend/app/database/alembic_runtime.py \
+  backend/app/database/postgres_test_safety.py \
+  backend/tests/conftest.py \
+  backend/tests/test_alembic_database_url.py \
+  backend/tests/test_postgres_test_safety.py \
+  backend/tests/test_indicator_scoring_postgres.py \
+  backend/tests/test_phase6b_postgres_migration.py
+mypy backend
+python -m compileall -q backend/app backend/tests alembic/versions
+git diff --check
+```
+
+```text
+All checks passed!
+8 files already formatted
+Success: no issues found in 86 source files
+```
+
+`compileall` and `git diff --check` exited zero without output. The repository-wide
+format check still reports only the unrelated pre-existing
+`backend/app/ingestion/rss_client.py`; it remains untouched.
+
+Final development read-only verification before and after destructive disposable-only
+tests was identical:
+
+```text
+current_database      = threatlens
+raw_articles          = 60
+indicators            = 456
+article_indicators    = 9930
+indicator_enrichments = 0
+epss_history          = 0
+```
+
+After each successful PostgreSQL run, the ownership-validated fixture removed
+`threatlens_phase6b_test`; final administrative inspection returned database count zero.
+No backup, recovery, development-data mutation, staging, or commit was performed.
