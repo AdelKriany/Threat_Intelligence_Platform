@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 from alembic import command
-from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import Engine, make_url
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
+
+from app.database.postgres_test_safety import (
+    OwnedDisposablePostgres,
+    create_guarded_test_engine,
+    run_guarded_alembic_command,
+)
 
 PHASE6B_TABLES = {
     "correlated_events",
@@ -22,41 +26,21 @@ PHASE6B_TABLES = {
 PARENT_REVISION = "b74f3c9a21de"
 
 
-def _postgres_url() -> str:
-    url = os.getenv("PHASE6B_POSTGRES_URL", "")
-    if not url:
-        pytest.skip("PHASE6B_POSTGRES_URL is not configured")
-    parsed = make_url(url)
-    if parsed.get_backend_name() != "postgresql" or parsed.database != "threatlens_phase6b_test":
-        pytest.fail(
-            "PHASE6B_POSTGRES_URL must target disposable threatlens_phase6b_test PostgreSQL"
-        )
-    return url
-
-
-def _alembic_config(url: str) -> Config:
-    config = Config("alembic.ini")
-    config.set_main_option("sqlalchemy.url", url)
-    return config
-
-
 def _reject(engine: Engine, statement: str, parameters: dict[str, object]) -> None:
     with pytest.raises(IntegrityError), engine.begin() as connection:
         connection.execute(text(statement), parameters)
 
 
 def test_postgres_migration_constraints_cascades_downgrade_and_reupgrade(
-    monkeypatch: pytest.MonkeyPatch,
+    phase6b_postgres_database: OwnedDisposablePostgres,
 ) -> None:
-    url = _postgres_url()
-    monkeypatch.setenv("DATABASE_URL", url)
-    config = _alembic_config(url)
-    engine = create_engine(url)
+    url = phase6b_postgres_database.url
+    engine = create_guarded_test_engine(url)
 
     # The database name is safety-checked above. Resetting the disposable database's
     # migration chain makes this lifecycle test repeatable after an interrupted run.
-    command.downgrade(config, "base")
-    command.upgrade(config, "head")
+    run_guarded_alembic_command(url, command.downgrade, "base")
+    run_guarded_alembic_command(url, command.upgrade, "head")
     inspector = inspect(engine)
     assert PHASE6B_TABLES.issubset(inspector.get_table_names())
     assert {column["name"] for column in inspector.get_columns("score_history")} == {
@@ -350,7 +334,7 @@ def test_postgres_migration_constraints_cascades_downgrade_and_reupgrade(
             == 1
         )
 
-    command.downgrade(config, PARENT_REVISION)
+    run_guarded_alembic_command(url, command.downgrade, PARENT_REVISION)
     downgraded_tables = set(inspect(engine).get_table_names())
     assert not PHASE6B_TABLES & downgraded_tables
     assert {"raw_articles", "indicators", "article_indicators"}.issubset(downgraded_tables)
@@ -362,6 +346,6 @@ def test_postgres_migration_constraints_cascades_downgrade_and_reupgrade(
             == 1
         )
 
-    command.upgrade(config, "head")
+    run_guarded_alembic_command(url, command.upgrade, "head")
     assert PHASE6B_TABLES.issubset(inspect(engine).get_table_names())
     engine.dispose()

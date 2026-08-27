@@ -26,19 +26,38 @@ def _load_runtime_settings() -> tuple[Any, Any]:
 
 settings, Base = _load_runtime_settings()
 
+from app.database.alembic_runtime import (  # noqa: E402
+    apply_resolved_database_url,
+    expected_database_name,
+    prepare_guarded_migration_connection,
+    require_url_database,
+    resolve_database_url,
+)
+
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", settings.database_url)
+resolved_database_url = resolve_database_url(
+    config,
+    application_url=settings.database_url,
+    cli_options=context.get_x_argument(as_dictionary=True),
+)
+apply_resolved_database_url(config, resolved_database_url)
+guarded_database_name = expected_database_name(config)
 target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode."""
 
-    url = config.get_main_option("sqlalchemy.url")
-    context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
+    if guarded_database_name is not None:
+        require_url_database(resolved_database_url, guarded_database_name)
+    context.configure(
+        url=resolved_database_url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+    )
 
     with context.begin_transaction():
         context.run_migrations()
@@ -54,6 +73,8 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        if guarded_database_name is not None:
+            prepare_guarded_migration_connection(connection, guarded_database_name)
         context.configure(connection=connection, target_metadata=target_metadata)
 
         with context.begin_transaction():
