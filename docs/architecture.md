@@ -455,3 +455,64 @@ Phase 5 adds `CISA_KEV_ENABLED`, `CISA_KEV_CATALOG_URL`, `CISA_KEV_TTL_SECONDS`,
 Compose passes these to API, worker, and Beat. `.env.example` contains safe defaults only; real
 secrets remain in `.env` or deployment secrets. Apply migrations and recreate application
 containers after changing Phase 5 settings.
+
+## Phase 6C indicator scoring API
+
+The versioned synchronous router is a thin transaction boundary over Phase 6B. It does not load
+provider payloads itself, calculate Formula v1, build or hash snapshots, insert score/component
+rows, or handle uniqueness races. Those responsibilities remain in
+`calculate_and_persist_indicator_score`. The service flushes without committing; the POST endpoint
+commits exactly once after constructing the complete response and rolls back every exception.
+
+| Method and path | Success | Behavior |
+| --- | --- | --- |
+| `POST /api/v1/indicators/{indicator_id}/score` | `200` | Calculate from stored evidence and persist or reuse the canonical score |
+| `GET /api/v1/indicators/{indicator_id}/score` | `200` | Return the latest persisted score only |
+| `GET /api/v1/indicators/{indicator_id}/score/history` | `200` | Return a bounded newest-first history page |
+
+POST accepts only the Boolean query parameter `force_refresh`, defaulting to `false`. For the
+default, the router supplies the latest persisted calculation time to Phase 6B, which reloads the
+currently stored evidence before Formula v1 calculation. This lets unchanged stored evidence
+reproduce and reuse its canonical snapshot. If new evidence postdates that calculation context, the
+same orchestration is retried at current UTC. `force_refresh=true` uses current UTC immediately; it
+is not an enrichment refresh and does not call any external provider. Neither path overrides the
+evidence hash or database uniqueness constraint, so an identical canonical snapshot returns the
+existing row and `created: false`.
+
+The POST response is:
+
+```json
+{
+  "created": false,
+  "score": {
+    "id": 456,
+    "indicator_id": 123,
+    "indicator_type": "cve",
+    "indicator_value": "CVE-2026-12345",
+    "score": 87.4,
+    "severity": "critical",
+    "formula_version": "phase6b-v1",
+    "evidence_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "as_of": "2026-08-28T12:00:00Z",
+    "calculated_at": "2026-08-28T12:00:00Z",
+    "components": []
+  }
+}
+```
+
+GET returns the nested `score` object directly and never includes `created`. Components expose only
+the safe Formula inputs persisted in `score_components`, normalized values, exact stored weights
+and contributions, freshness multiplier, provider/evidence status, evidence timestamp, and
+explanation. Raw enrichment responses and the full canonical evidence document are never returned.
+
+Latest ordering is `calculated_at DESC, id DESC`. History uses the same deterministic ordering,
+with `limit` default 20/minimum 1/maximum 100 and `offset` default 0/minimum 0:
+
+```json
+{"indicator_id": 123, "items": [], "limit": 20, "offset": 0, "total": 0}
+```
+
+An existing indicator without a latest score returns `404 SCORE_NOT_FOUND`; its history returns an
+empty page. A missing indicator returns `404 INDICATOR_NOT_FOUND`. Invalid stored canonical data
+that Formula v1 cannot score returns `422 INDICATOR_UNSCORABLE`. Normal FastAPI path/query
+validation uses `422`; unexpected exceptions use the centralized sanitized `500` response.

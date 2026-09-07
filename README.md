@@ -230,6 +230,35 @@ NVD-only backfill commands.
 Phase 5 adds CISA KEV and FIRST EPSS to NVD for CVE enrichment. KEV provides confirmed active
 exploitation, EPSS provides a 0–1 probability of exploitation in the next 30 days, and NVD
 provides severity and vulnerability metadata. These remain separate provider observations;
-Phase 6 combined risk scoring is not implemented. See the
+Phase 6 Formula v1 scoring and its indicator REST API are implemented without changing provider
+enrichment. See the
 [Phase 5 architecture](docs/architecture.md#phase-5-cve-enrichment) for configuration, bounded
 tasks, retry behavior, and coverage queries.
+
+## Indicator scoring API
+
+Phase 6C exposes persisted Phase 6B Formula v1 scores under `/api/v1`:
+
+```bash
+curl -X POST \
+  "http://127.0.0.1:8000/api/v1/indicators/123/score?force_refresh=false"
+
+curl \
+  "http://127.0.0.1:8000/api/v1/indicators/123/score"
+
+curl \
+  "http://127.0.0.1:8000/api/v1/indicators/123/score/history?limit=20&offset=0"
+```
+
+POST reads trusted evidence already stored in PostgreSQL; clients cannot submit evidence, provider
+payloads, scores, or formula versions. The default reuses the latest persisted calculation time
+while Phase 6B reloads the stored evidence, allowing an unchanged canonical snapshot to resolve to
+its existing row. `force_refresh=true` uses current UTC and recalculates. It does not contact NVD,
+CISA KEV, FIRST EPSS, VirusTotal, AbuseIPDB, or trigger enrichment. Phase 6B's evidence hash and
+unique database index remain authoritative, so either flag value may return the same canonical
+record with `created: false`.
+
+Latest and history reads never recalculate. History is ordered by `calculated_at DESC, id DESC`,
+defaults to `limit=20&offset=0`, accepts limits from 1 through 100, and returns an empty `items` list
+for an existing indicator with no scores. See [the architecture documentation](docs/architecture.md#phase-6c-indicator-scoring-api)
+for response and error contracts.

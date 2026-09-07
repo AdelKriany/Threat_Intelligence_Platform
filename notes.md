@@ -1285,3 +1285,112 @@ epss_history          = 0
 After each successful PostgreSQL run, the ownership-validated fixture removed
 `threatlens_phase6b_test`; final administrative inspection returned database count zero.
 No backup, recovery, development-data mutation, staging, or commit was performed.
+
+## Phase 6C indicator scoring REST API — 2026-08-28
+
+Phase 6C adds only the synchronous indicator scoring API, explicit Pydantic response
+contracts, a request-scoped SQLAlchemy dependency, stable safe API errors, focused
+portable/PostgreSQL tests, and API documentation. No migration was required. The API
+delegates evidence loading, Formula v1 calculation, canonical snapshot construction,
+SHA-256 hashing, component persistence, savepoint handling, and concurrency resolution
+unchanged to Phase 6B.
+
+Endpoints:
+
+```text
+POST /api/v1/indicators/{indicator_id}/score?force_refresh=false
+GET  /api/v1/indicators/{indicator_id}/score
+GET  /api/v1/indicators/{indicator_id}/score/history?limit=20&offset=0
+```
+
+POST returns `200` with `{created, score}`. The endpoint owns one outer transaction,
+constructs the response after the Phase 6B flush, commits once, and rolls back every
+failure. The default supplies the latest persisted calculation time to Phase 6B so
+unchanged stored evidence reproduces its canonical snapshot; evidence that postdates
+that context is retried at current UTC. `force_refresh=true` uses current UTC through
+the same orchestration entry point. It never calls enrichment providers or bypasses
+canonical evidence uniqueness, so it can return `created: false`. Latest/history GETs
+never score or write. Both order by
+`calculated_at DESC, id DESC`; history bounds `limit` to 1–100 and counts in SQL.
+
+Errors use `404 INDICATOR_NOT_FOUND`, `404 SCORE_NOT_FOUND`, and
+`422 INDICATOR_UNSCORABLE`; normal FastAPI validation remains `422`, and unexpected
+errors retain the sanitized centralized `500` response. Full canonical evidence and
+raw enrichment responses are not exposed. Latest uses two SELECTs and history uses
+four SELECTs independent of the number of score rows/components on the requested page.
+
+Validation was run in the required order:
+
+```bash
+pytest -q backend/tests/test_indicator_score_schemas.py
+pytest -q backend/tests/test_indicator_scores_api.py
+pytest -q backend/tests/test_indicator_scores_api.py -k 'failure or integrity'
+pytest -q backend/tests/test_indicator_scores_api.py -k 'latest or history'
+pytest -q backend/tests/test_indicator_scores_api.py -k 'queries_are_constant'
+pytest -q backend/tests/test_indicator_score_schemas.py backend/tests/test_indicator_scores_api.py
+pytest -q backend/tests/test_indicator_scoring_service.py
+pytest -q backend/tests/test_scoring_engine.py
+pytest -q backend/tests/test_phase6b_persistence.py
+```
+
+Observed results were respectively 3 passed; 21 passed; 2 passed/19 deselected;
+10 passed/11 deselected; 1 passed/20 deselected; 24 passed; 47 passed; 109 passed;
+and 19 passed.
+
+The guarded PostgreSQL runs used only `threatlens_phase6b_test` over Docker's internal
+network. The focused run included the router transaction race, existing Phase 6B
+orchestration race, and migration lifecycle:
+
+```bash
+docker compose run --rm --no-deps -T --entrypoint sh -w /workspace \
+  -v "$PWD:/workspace:ro" \
+  -v /tmp/threatlens-phase6c-logs:/workspace/backend/logs:rw,z \
+  -e DATABASE_URL=postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens_phase6b_test \
+  -e PHASE6B_POSTGRES_URL=postgresql+psycopg://threatlens:threatlens@postgres:5432/threatlens_phase6b_test \
+  api -c 'PYTHONPATH=/workspace/backend /app/.venv/bin/python -m pytest -q \
+  -p no:cacheprovider backend/tests/test_indicator_scores_api_postgres.py \
+  backend/tests/test_indicator_scoring_postgres.py \
+  backend/tests/test_phase6b_postgres_migration.py'
+```
+
+Observed focused PostgreSQL result: 4 passed in 7.16s. The full suites were:
+
+```bash
+pytest -q
+# same guarded disposable-container environment, then:
+python -m pytest -q -p no:cacheprovider
+```
+
+Final observed results: 352 passed, 4 PostgreSQL-only skipped in 5.90s; then 356 passed
+in 15.00s with PostgreSQL enabled. The first full container attempt stopped during
+collection because its temporary log mount lacked SELinux relabeling; rerunning with
+`:rw,z` passed. No application change was made for that environment-only failure.
+
+Quality checks:
+
+```bash
+ruff check backend/app backend/tests alembic/versions alembic/env.py
+ruff format --check <nine changed Python files>
+black --check <each changed Python file>
+mypy backend
+python -m compileall -q backend/app backend/tests alembic/versions
+git diff --check
+```
+
+Observed results: Ruff passed; Ruff reported all 9 files formatted; Black reported all
+9 files unchanged; Mypy reported no issues in 91 source files; compileall and
+`git diff --check` exited zero without output.
+
+Read-only development counts before and after were identical:
+
+```text
+raw_articles          = 60
+indicators            = 456
+article_indicators    = 9930
+indicator_enrichments = 0
+epss_history          = 0
+```
+
+The owned disposable fixture removed `threatlens_phase6b_test` after each successful
+run. Nothing was staged, committed, or pushed; `engineDElete.txt` and
+`modelsDElete.txt` were not touched.
