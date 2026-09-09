@@ -516,3 +516,52 @@ An existing indicator without a latest score returns `404 SCORE_NOT_FOUND`; its 
 empty page. A missing indicator returns `404 INDICATOR_NOT_FOUND`. Invalid stored canonical data
 that Formula v1 cannot score returns `422 INDICATOR_UNSCORABLE`. Normal FastAPI path/query
 validation uses `422`; unexpected exceptions use the centralized sanitized `500` response.
+
+## Phase 7 exact CVE event correlation
+
+Phase 7 introduces a synchronous service boundary for deterministic correlation of one stored,
+canonical CVE indicator. It uses the existing `correlated_events`, `event_articles`, and
+`event_indicators` schema; no migration, API, task, schedule, trigger, or event scoring path is
+added.
+
+```text
+correlate_cve_indicator(session, indicator_id, *, as_of)
+    -> CVECorrelationResult
+```
+
+The service requires a timezone-aware logical timestamp and an existing `IOCType.CVE` indicator
+whose stored value is already the validator's canonical uppercase form. Missing indicators,
+non-CVE indicators, and malformed/noncanonical CVE rows produce distinct typed errors before any
+event write. A valid CVE with no articles still creates its event and indicator relationship.
+
+The stable event identity and metadata are:
+
+```text
+event_key    = cve:<UPPERCASE-CVE>
+title        = <UPPERCASE-CVE> vulnerability
+rule_name    = shared-cve
+rule_version = v1
+reason       = shared_canonical_cve
+```
+
+All current `article_indicators` rows for the CVE are loaded in one ordered query and inserted as
+event relationships in one statement. PostgreSQL and SQLite use conflict handling scoped to the
+documented event-key unique constraint and relationship primary keys. This makes repeated and
+concurrent calls idempotent without catching unrelated `IntegrityError` instances. A pre-existing
+stable key with incompatible title/rule metadata is rejected instead of silently rewritten.
+
+The result exposes the persisted event, whether it was created, whether the indicator link was
+created, and the exact sorted article IDs newly linked by this call. When a reused event gains a
+new relationship, only `updated_at` advances. Existing articles, canonical indicators,
+enrichments, indicator scores, event scores, and historical rows are never merged, deleted, or
+recalculated.
+
+The caller owns the outer transaction. The service performs a final flush but never commits or
+rolls back. A normal operation uses six SQL statements independent of whether one or many articles
+are linked; extending an existing event adds one bounded `updated_at` statement. PostgreSQL tests
+exercise two independent sessions racing on the same CVE and verify one event, unique links, no
+deadlock, and preservation of unrelated caller work.
+
+Non-CVE correlation, fuzzy/title similarity, shared network indicators, embeddings, actor/malware
+matching, campaign inference, automatic ingestion hooks, backfill tooling, event scoring, and an
+event API remain intentionally deferred.
