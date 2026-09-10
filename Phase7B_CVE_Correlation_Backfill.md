@@ -4,14 +4,14 @@ Date: 2026-09-10
 
 ## Purpose
 
-Phase 8 adds an explicit operational entry point for the Phase 7 exact-CVE correlation
+Phase 7B adds an explicit operational entry point for the Phase 7A exact-CVE correlation
 service. It can inspect or process one deterministic, size-capped page of stored CVE
 indicators. Dry-run is the default and performs no writes. Apply mode must be requested
 explicitly and commits only the selected page.
 
 This increment reuses the existing database schema. It does not add a migration,
 event scoring, an API, a scheduled task, an ingestion trigger, or non-CVE/fuzzy
-correlation. `docs/architecture.md` was deliberately not edited for Phase 8.
+correlation. `docs/architecture.md` was deliberately not edited for Phase 7B.
 
 ## Command interface
 
@@ -108,9 +108,9 @@ specific `cve:CVE-2026-72001` stable key owned by that test. This allows Postgre
 integration tests to share the session-scoped disposable fixture without ordering
 assumptions or destructive between-test cleanup.
 
-### `Phase8_CVE_Correlation_Backfill.md` — created
+### `Phase7B_CVE_Correlation_Backfill.md` — created
 
-This document records the interface, design decisions, every Phase 8 file change,
+This document records the interface, design decisions, every Phase 7B file change,
 actual verification, encountered problems, operating boundaries, and keep/push
 guidance.
 
@@ -118,8 +118,8 @@ The pre-existing uncommitted Phase 7 files
 `backend/app/services/cve_correlation.py`,
 `backend/tests/test_cve_correlation_service.py`,
 `backend/tests/test_cve_correlation_postgres.py`, and the Phase 7 addition already in
-`docs/architecture.md` remain dependencies of Phase 8. Apart from the test-isolation
-assertion described above, Phase 8 did not alter their behavior. `notes.md` was not
+`docs/architecture.md` remain dependencies of Phase 7B. Apart from the test-isolation
+assertion described above, Phase 7B did not alter their behavior. `notes.md` was not
 edited in this increment.
 
 ## Verification actually performed
@@ -235,7 +235,7 @@ the backfill command, and no manual database cleanup was performed.
 ## What to keep and push
 
 All source, test, and documentation files below should be kept, committed, and pushed
-together because Phase 8 depends on the uncommitted Phase 7 implementation:
+together because Phase 7B depends on the uncommitted Phase 7A implementation:
 
 ```text
 backend/app/services/cve_correlation.py
@@ -245,7 +245,7 @@ backend/tests/test_cve_correlation_postgres.py
 backend/tests/test_cve_correlation_backfill.py
 backend/tests/test_cve_correlation_backfill_postgres.py
 docs/architecture.md
-Phase8_CVE_Correlation_Backfill.md
+Phase7B_CVE_Correlation_Backfill.md
 ```
 
 The test files are part of the permanent regression suite and should be committed and
@@ -257,7 +257,7 @@ pushed. Test runtime artifacts are not source and should not be committed or pus
 .ruff_cache/
 **/__pycache__/
 .coverage
-/tmp/threatlens-phase8-logs/
+/tmp/threatlens-phase7b-logs/
 ```
 
 No migration file, database dump, log, generated report, or environment file belongs
@@ -265,7 +265,7 @@ to this increment. Nothing was staged, committed, or pushed by Codex.
 
 ## Summary and remaining work
 
-Phase 8 adds a safe, bounded, deterministic dry-run/apply CVE correlation backfill,
+Phase 7B adds a safe, bounded, deterministic dry-run/apply CVE correlation backfill,
 including explicit cursors and forecasts, transactional apply, concurrent idempotency,
 and full portable/PostgreSQL coverage. Event scoring, APIs, automatic invocation,
 scheduling, and broader correlation rules remain separate future increments.
