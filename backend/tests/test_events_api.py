@@ -17,6 +17,7 @@ from app.database.session import get_db_session
 from app.ingestion.models import Indicator, IndicatorEnrichment, IOCType, RawArticle
 from app.main import create_app
 from app.models.phase6b import CorrelatedEvent, EventArticle, EventIndicator, ScoreHistory
+from app.services.event_scoring import calculate_and_persist_event_score
 
 NOW = datetime(2026, 9, 10, 12, tzinfo=UTC)
 
@@ -248,6 +249,39 @@ def test_event_detail_has_counts_score_summary_and_no_relationship_collections(
     assert "articles" not in payload
     assert "indicators" not in payload
     assert "canonical_evidence" not in response.text
+
+
+def test_event_detail_reads_phase9a_persisted_score_without_api_changes(
+    app: FastAPI,
+    api_database: tuple[Engine, sessionmaker[Session]],
+) -> None:
+    _, factory = api_database
+    with factory() as session:
+        event_row = _event(session, 14)
+        indicator = _indicator(session, event_row, "CVE-2026-82014")
+        _article(session, event_row, "phase9a-one", source_name="Source A")
+        _article(session, event_row, "phase9a-two", source_name="Source B")
+        _score(
+            session,
+            sequence=14,
+            indicator_id=indicator.id,
+            calculated_at=NOW,
+            score=Decimal("80"),
+        )
+        session.commit()
+        persisted = calculate_and_persist_event_score(session, event_row.id, as_of=NOW)
+        session.commit()
+        assert persisted.score_history.score == Decimal("74.50")
+
+    response = _request(app, f"/api/v1/events/{event_row.id}")
+
+    assert response.status_code == 200
+    assert response.json()["latest_score"] == {
+        "score": 74.5,
+        "severity": "high",
+        "formula_version": "phase9a-event-v1",
+        "calculated_at": "2026-09-10T12:00:00Z",
+    }
 
 
 def test_event_articles_paginate_and_use_published_then_fetched_timestamp(
