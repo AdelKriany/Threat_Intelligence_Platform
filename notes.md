@@ -1676,3 +1676,803 @@ Phase 8 adds a safe, bounded, deterministic dry-run/apply CVE correlation backfi
 including explicit cursors and forecasts, transactional apply, concurrent idempotency,
 and full portable/PostgreSQL coverage. Event scoring, APIs, automatic invocation,
 scheduling, and broader correlation rules remain separate future increments.
+
+## Phase 8 — correlated-event REST API — 2026-09-10
+
+Implemented a typed, read-only FastAPI interface for persisted correlated events. It
+does not invoke correlation/backfill, calculate scores, call providers, write rows, or
+commit transactions. Existing schema and indexes were sufficient; no migration or
+speculative index was added.
+
+Endpoints:
+
+```text
+GET /api/v1/events
+GET /api/v1/events/{event_id}
+GET /api/v1/events/{event_id}/articles
+GET /api/v1/events/{event_id}/indicators
+```
+
+Collections use `limit` 1–100 (default 20), non-negative `offset`, SQL totals, and
+deterministic ordering. Events order by `updated_at DESC, id DESC`; articles by
+`COALESCE(published_at, fetched_at) DESC, id DESC`; indicators by type, value, ID.
+List filters are exact canonical uppercase `cve`, exact linked `source_name`, and
+inclusive timezone-aware `updated_from`/`updated_to`. `EXISTS` filters prevent source
+matches from duplicating events.
+
+Latest persisted event/indicator scores use `calculated_at DESC, id DESC` window
+ranking and expose only score, severity, formula version, and timestamp. Missing
+scores are `null`. Raw article content, enrichment/provider responses, canonical
+evidence, evidence hashes, and components are excluded. Stable errors are
+`EVENT_NOT_FOUND`, `INVALID_CVE_FILTER`, and `INVALID_EVENT_FILTER`.
+
+Files created or modified:
+
+- `backend/app/api/v1/events.py`: thin read-only router and safe validation/errors.
+- `backend/app/api/v1/router.py`: event-router registration.
+- `backend/app/schemas/events.py`: typed UTC response/page contracts.
+- `backend/app/services/event_queries.py`: bounded aggregate, filter, ordering, and
+  latest-score queries.
+- `backend/tests/test_event_schemas.py`: schema tests.
+- `backend/tests/test_events_api.py`: portable API/filter/order/privacy/read-only/query
+  tests.
+- `backend/tests/test_events_api_postgres.py`: guarded PostgreSQL ordering, source
+  de-duplication, and tied-score tests.
+- `docs/architecture.md`: endpoint/query/error/read-only/deferred contracts.
+- `Phase8_Correlated_Event_REST_API.md`: focused phase record.
+- `notes.md`: this log.
+- `Phase7B_CVE_Correlation_Backfill.md`: internal Phase 7B naming correction after
+  external commit `0bf5e9a` appeared during this task.
+
+Observed query counts are fixed: event list two SELECTs, detail one, articles two,
+indicators two. Grouped counts, correlated `EXISTS`, and window-ranked scores avoid
+N+1 queries.
+
+Exact verification commands and observed results:
+
+```bash
+pytest -q backend/tests/test_event_schemas.py backend/tests/test_events_api.py
+# 24 passed in 1.39s
+
+pytest -q backend/tests/test_indicator_score_schemas.py backend/tests/test_indicator_scores_api.py
+# 24 passed in 1.50s
+
+pytest -q backend/tests/test_cve_correlation_service.py
+# 14 passed in 0.75s
+
+pytest -q backend/tests/test_cve_correlation_backfill.py
+# 9 passed in 0.65s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_events_api_postgres.py
+# 1 passed in 1.50s
+
+pytest -q
+# 399 passed, 7 skipped in 6.99s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q
+# 406 passed in 9.86s
+
+ruff check backend/app backend/tests alembic/versions alembic/env.py
+# All checks passed.
+
+ruff format --check <seven Phase 8 Python files>
+# 7 files already formatted.
+
+black --check <each of those files, serially>
+# Each would be left unchanged.
+
+mypy backend
+# Success: no issues found in 103 source files.
+
+python -m compileall -q backend/app backend/tests alembic
+# Exit 0, no output.
+
+git diff --check
+# Exit 0, no output.
+```
+
+The repository-wide Ruff format check reported 111 formatted files and only the known
+unrelated `backend/app/ingestion/rss_client.py` as requiring formatting; it remained
+untouched. The initial API query-count test had 20 passes and one failure because its
+recorder included SQLite `BEGIN`; counting SELECTs per the Phase 6C convention fixed
+the test. The focused suite then passed all 24 tests.
+
+PostgreSQL isolation was preserved. Before and after testing, the exact fixture name
+`threatlens_phase6b_test` was absent. Only the hardened fixture created, marked, and
+removed it; no manual database cleanup ran. Read-only development transactions were
+rolled back and returned identical observations:
+
+```text
+current_database      = threatlens
+raw_articles          = 211
+indicators            = 1102
+article_indicators    = 32174
+indicator_enrichments = 130
+epss_history          = 163
+correlated_events     = 0
+event_articles        = 0
+event_indicators      = 0
+score_history         = 1
+```
+
+Event-score calculation/persistence, score/severity filters, writes, authentication,
+automatic correlation, dashboards, and non-CVE/fuzzy rules remain deferred. The next
+recommended increment is a separately specified event-scoring workflow.
+
+Summary: added four read-only event endpoints with typed safe responses, exact
+filters, deterministic pagination, optional persisted-score summaries, and bounded
+queries; final results were 399 passed/7 skipped portable and 406 passed PostgreSQL;
+event scoring and score filtering remain unfinished. Nothing was staged, committed,
+or pushed by Codex.
+Final working diff: 11 files, 1,805 additions, and 11 deletions.
+
+## Phase 9A — explainable event scoring and persistence — 2026-09-11
+
+Phase 8 was verified as commit `4d6927b` before implementation, and initial `git status --short`
+reported a clean tree. The final audit revealed pre-existing modifications to
+`docs/architecture.md` and `notes.md` hidden by Git `assume-unchanged` flags. Only those two flags
+were cleared, without staging; the earlier Phase 8 documentation was preserved and is consequently
+included in the final visible diff. The Phase 6B models already contained event-target score history, component persistence, and
+the partial unique index `uq_score_history_event_evidence`; therefore this increment required no
+schema or migration change.
+
+### What was implemented and why
+
+Phase 9A implements deterministic scoring and append-only persistence for Phase 7 exact-CVE events.
+It gives persisted correlated events an explainable priority score while retaining the existing
+indicator score as the sole member-risk input:
+
+```text
+event score = latest persisted matching CVE indicator score * 0.90
+            + min(max(distinct normalized sources - 1, 0), 4) / 4 * 10
+```
+
+The separate formula version is `phase9a-event-v1`. Decimal arithmetic is used throughout; the
+combined result is clamped to `0.00..100.00`, rounded once with `ROUND_HALF_UP`, and classified by
+the existing severity thresholds. For example, member score 80 with one source is 72.00, with two
+sources is 74.50, and a missing member with three sources is 5.00. A missing member component is
+recorded as missing with zero contribution and an explicit warning; it never triggers indicator
+scoring or provider access.
+
+Only `cve:<CANONICAL-UPPERCASE-CVE>` events with rule `shared-cve:v1` are supported. The loader
+requires exactly one canonical CVE relationship matching the key. Typed errors distinguish a
+missing event, unsupported rule/type, invalid key, missing relationship, ambiguous relationships,
+inconsistent relationships, and invalid stored member-score evidence. The latest member indicator
+score uses `target_kind='indicator'` and ordering `calculated_at DESC, id DESC`.
+
+Source names are loaded through `event_articles`. Null/blank values do not count. The existing
+normalizer trims, collapses internal whitespace, case-folds, de-duplicates, and sorts names, which
+also makes evidence hashing deterministic.
+
+The canonical snapshot contains event ID/key/rule, formula, canonical CVE ID/value, `as_of`, sorted
+normalized sources, and either explicit member absence or its score-history identity, indicator
+identity, score, severity, formula, evidence hash, and timestamp. It excludes final event output,
+derived ratios/contributions, full member evidence documents, provider responses, secrets, and ORM
+objects. Strict sorted compact UTF-8 JSON is SHA-256 hashed, and stored JSON is produced from those
+same bytes. The derived-result serializer is explicitly documented as unsuitable for evidence
+hashing.
+
+Public service interface:
+
+```python
+calculate_and_persist_event_score(
+    session: Session,
+    event_id: int,
+    *,
+    as_of: datetime,
+) -> PersistedEventScore
+```
+
+The result exposes the persisted `ScoreHistory`, ordered component rows, creation/reuse status, and
+evidence hash. The service flushes but does not commit. Identical event/formula/hash evidence is
+reused; a changed latest member, source set, or `as_of` context appends history. A savepoint handles
+only the exact named event uniqueness race and re-queries the winner. Unrelated integrity errors
+propagate, unrelated caller work remains in the outer transaction, and caller rollback removes all
+new event-score rows/components.
+
+### Files created or modified
+
+- `backend/app/scoring/event_models.py`: immutable event evidence, member evidence, and result types.
+- `backend/app/scoring/event_engine.py`: pure Event Formula v1 calculation, components, warnings,
+  rounding/severity, and deterministic derived-result serialization.
+- `backend/app/scoring/event_evidence_snapshot.py`: canonical evidence payload and SHA-256 hash.
+- `backend/app/services/event_scoring.py`: invariant-aware evidence loading and append/reuse service.
+- `backend/tests/test_event_scoring.py`: pure formula, source caps, normalization, severity boundaries,
+  numeric/time validation, missing evidence, component order, and determinism.
+- `backend/tests/test_event_scoring_service.py`: portable service, snapshot, idempotency, append,
+  rollback, preservation, and typed-error coverage.
+- `backend/tests/test_event_scoring_postgres.py`: guarded two-session uniqueness race and unrelated
+  caller-work preservation.
+- `backend/tests/test_events_api.py`: Phase 8 regression showing a persisted Phase 9A score through
+  the existing read-only detail contract.
+- `docs/architecture.md`: Event Formula v1, snapshot, transactions, concurrency, and boundaries.
+- `Phase9A_Event_Scoring_and_Persistence.md`: focused implementation and verification record.
+- `notes.md`: this dated development log.
+
+### Problems encountered and resolutions
+
+1. The first portable service run passed 24 tests and failed the caller-rollback assertion because
+   Python's SQLite legacy mode does not begin a database transaction for SELECT before a savepoint.
+   The test now establishes the caller-owned outer `BEGIN`, matching the repository's indicator
+   persistence test. The next focused run passed all 25 tests then present; final split runs passed
+   19 pure and 11 service tests.
+2. One combined verification command used the nonexistent filename `backend/tests/test_scoring.py`.
+   Pure and service tests in that command passed, then pytest exited 4 before indicator collection.
+   The command was corrected to `test_scoring_engine.py`; 180 indicator-scoring tests passed.
+3. The first sandboxed PostgreSQL attempt could not connect to local port 5433 and ended with one
+   setup error. It was rerun through the approved local-access path; the guarded focused race passed.
+4. The first combined PostgreSQL order ran indicator modules before the older bounded backfill
+   module. Rows intentionally committed by those earlier modules entered that module's unscoped
+   first page, so it reported one forecast instead of two: 7 tests passed and 1 failed. The same
+   eight modules were rerun in repository isolation order and all 8 passed. No production or
+   historical test was altered for this ordering-only interaction.
+5. A multi-file Black check could not create its sandbox worker process (`PermissionError`) before
+   formatting results. The identical eight file checks were executed serially; every file passed.
+6. The repository-wide Ruff format check still reports the known unrelated
+   `backend/app/ingestion/rss_client.py`; it was not modified.
+7. Git initially hid `docs/architecture.md` and `notes.md` because both were marked
+   `assume-unchanged`. The flags were cleared only for those paths so the required Phase 9A edits
+   and the preserved earlier Phase 8 documentation will be visible to a future commit. Nothing was
+   staged.
+
+### Exact verification commands and observed results
+
+Focused pure and service tests:
+
+```bash
+pytest -q backend/tests/test_event_scoring.py
+# 19 passed in 0.33s
+
+pytest -q backend/tests/test_event_scoring_service.py
+# 11 passed in 0.66s
+```
+
+Existing behavior regressions:
+
+```bash
+pytest -q backend/tests/test_scoring_engine.py \
+  backend/tests/test_indicator_scoring_service.py \
+  backend/tests/test_indicator_score_schemas.py \
+  backend/tests/test_indicator_scores_api.py
+# 180 passed in 2.29s
+
+pytest -q backend/tests/test_event_schemas.py backend/tests/test_events_api.py
+# 25 passed in 1.49s
+
+pytest -q backend/tests/test_cve_correlation_service.py \
+  backend/tests/test_cve_correlation_backfill.py
+# 23 passed in 0.87s
+```
+
+PostgreSQL tests used only the guarded environment variable below. The focused run passed 1 test;
+the final combined run passed all 8 modules/tests:
+
+```bash
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_event_scoring_postgres.py
+# 1 passed in 1.68s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_cve_correlation_backfill_postgres.py \
+  backend/tests/test_cve_correlation_postgres.py \
+  backend/tests/test_event_scoring_postgres.py \
+  backend/tests/test_events_api_postgres.py \
+  backend/tests/test_indicator_scoring_postgres.py \
+  backend/tests/test_indicator_scores_api_postgres.py \
+  backend/tests/test_phase6b_postgres_migration.py
+# 8 passed in 4.39s
+```
+
+Final suites:
+
+```bash
+pytest -q
+# 430 passed, 8 skipped in 7.81s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q
+# 438 passed in 11.51s
+```
+
+The eight portable skips were the explicitly PostgreSQL-only tests. No final-suite test failed.
+
+Quality checks:
+
+```bash
+ruff check backend/app backend/tests alembic/versions alembic/env.py
+# All checks passed.
+
+ruff format --check backend/app/scoring/event_models.py \
+  backend/app/scoring/event_engine.py \
+  backend/app/scoring/event_evidence_snapshot.py \
+  backend/app/services/event_scoring.py \
+  backend/tests/test_event_scoring.py \
+  backend/tests/test_event_scoring_service.py \
+  backend/tests/test_event_scoring_postgres.py \
+  backend/tests/test_events_api.py
+# 8 files already formatted.
+
+# Black was run once per focused file to avoid sandbox multiprocessing.
+black --check <each of the eight focused Python files, serially>
+# Each file would be left unchanged.
+
+mypy backend
+# Success: no issues found in 110 source files.
+
+python -m compileall -q backend/app backend/tests alembic
+# Exit 0 with no output.
+
+git diff --check
+# Exit 0 with no output.
+
+ruff format --check backend/app backend/tests alembic/versions alembic/env.py
+# 118 files already formatted; only known unrelated rss_client.py would be reformatted.
+```
+
+### PostgreSQL isolation and development preservation
+
+Administrative exact-name checks before and after validation both returned zero databases named
+`threatlens_phase6b_test`. Each pytest invocation let `OwnedDisposablePostgres` create the exact
+database, attach its per-run ownership marker, verify it on every guarded connection, and delete it
+through ownership-validated cleanup. No manual create, drop, truncate, schema cleanup, wildcard,
+volume, or fallback deletion was performed.
+
+Read-only development transactions before and after validation returned identical observations:
+
+```text
+current_database      = threatlens
+raw_articles          = 222
+indicators            = 1169
+article_indicators    = 34271
+indicator_enrichments = 136
+epss_history          = 163
+correlated_events     = 0
+event_articles        = 0
+event_indicators      = 0
+score_history         = 1
+```
+
+Both transactions ended with `ROLLBACK`. The development database was not used for tests and was
+not mutated.
+
+### Remaining work and concise summary
+
+Event-score write/read endpoints, event score filters, CLI/backfill scoring, tasks/schedules,
+automatic triggers, provider access, non-CVE aggregation, fuzzy/campaign scoring, analyst
+overrides, authentication, dashboards, and notifications remain unfinished. The next recommended
+increment is a separately specified event-scoring API or bounded backfill, without combining the
+two concerns.
+
+Summary: Phase 9A added pure `phase9a-event-v1` calculation, canonical evidence hashing,
+transaction-safe append/reuse persistence, typed exact-CVE invariants, API-read regression, and a
+real two-session PostgreSQL race test. Final results were 430 passed/8 skipped portable and 438
+passed with PostgreSQL; development counts were identical before/after, no schema changed, and no
+work was staged, committed, or pushed. Event scoring automation and write APIs remain deferred.
+The final diff includes the surfaced earlier documentation plus Phase 9A.
+Final working diff: 11 files, 1,932 additions, and 1 deletion.
+
+## Phase 9B — Event Scoring REST API — 2026-09-11
+
+Phase 9A's pure engine, evidence snapshot, persistence service, and focused tests were confirmed in
+commit `1e592e9`. The initial tree was not clean: the Phase 9A API regression in
+`backend/tests/test_events_api.py`, both documentation files, and the untracked
+`Phase9A_Event_Scoring_and_Persistence.md` remained. They were preserved. No schema gap was found,
+so Phase 9B adds no migration or model change.
+
+### Implementation and public contracts
+
+Phase 9B adds:
+
+```text
+POST /api/v1/events/{event_id}/score?force_refresh=false
+GET  /api/v1/events/{event_id}/score
+GET  /api/v1/events/{event_id}/score/history?limit=20&offset=0
+```
+
+POST calls only `calculate_and_persist_event_score`. It builds the complete typed response before
+committing exactly once; every expected or unexpected failure rolls back. Phase 9A still owns all
+evidence loading, formula calculation, canonical hashing, append/reuse persistence, and exact
+uniqueness-race handling.
+
+Default POST reuses the latest persisted event score's `calculated_at` as `as_of`, normalized to
+UTC; without a prior score it uses current UTC. A genuinely invalid reusable context retries once
+at current UTC through the same service. `force_refresh=true` uses current UTC immediately. Neither
+flag bypasses hashing: identical evidence plus identical context returns `created=false`. Neither
+mode runs correlation/backfill, indicator scoring, enrichment, provider clients, or network calls.
+
+Latest/history filter `target_kind='event'`, the requested event ID, and `indicator_id IS NULL`,
+ordered by `calculated_at DESC, id DESC`. History enforces limit 1–100, offset >=0, and SQL total.
+Latest uses two SELECTs and history three, independent of page/component size.
+
+`EventScoreResponse` contains score-history ID, event ID/key/title, score, severity, formula,
+evidence hash, UTC `as_of`/calculation timestamps, and fixed-profile components. The POST wrapper
+adds `created`; history adds event ID, page fields, and total. Components expose only safe formula
+input, normalized input, weight, contribution, freshness, status, optional provider/timestamp, and
+explanation. Member status comes from the safe snapshot state, including explicit `missing`.
+Canonical evidence, raw enrichment/provider data, credentials, and internal errors are excluded.
+
+Stable API errors are `404 EVENT_NOT_FOUND`, `404 EVENT_SCORE_NOT_FOUND`, and
+`422 EVENT_UNSCORABLE`. Unsupported/invalid keys or rules, missing/ambiguous/inconsistent CVE
+relationships, invalid member-score evidence, and typed scoring inputs map to the safe unscorable
+message. Unexpected failures retain the centralized sanitized 500 response.
+
+### Files created or modified and purpose
+
+- `backend/app/schemas/event_scores.py`: event-specific Pydantic score/component/POST/history models.
+- `backend/app/services/event_score_queries.py`: safe latest/history SQL, UTC reusable context,
+  deterministic component ordering/status, and response mapping.
+- `backend/app/api/v1/event_scores.py`: thin transaction and error-mapping router.
+- `backend/app/api/v1/router.py`: registers the new routes before existing Phase 8 event routes.
+- `backend/tests/test_event_score_schemas.py`: schema, Decimal, UTC, hash, exclusion, and bounds tests.
+- `backend/tests/test_event_scores_api.py`: portable endpoint, force/reuse, transaction, error,
+  ordering, pagination, safety, query-count, OpenAPI, route, and boundary tests.
+- `backend/tests/test_event_scores_api_postgres.py`: concurrent real-API PostgreSQL uniqueness race.
+- `docs/architecture.md`: Phase 9B API, transactions, errors, queries, safety, and deferred scope.
+- `Phase9B_Event_Scoring_REST_API.md`: focused phase implementation and verification record.
+- `notes.md`: this appended development log.
+
+The pre-existing Phase 9A changes listed above remain visible in the final working tree.
+
+### Problems encountered and resolutions
+
+1. The first full API run produced 9 passes and 4 failures. SQLite returned the prior score time
+   without timezone metadata, tracking counters incremented a sessionmaker subclass, and default
+   `CorrelatedEvent` select-in relationships expanded latest reads to six queries. The reusable time
+   is now normalized to UTC, counters target the base tracking session, and relationship loading is
+   explicitly suppressed. The final counts are two SELECTs for latest and three for history.
+2. Two combined schema/API invocations stalled while transitioning modules in the command runner
+   and were manually interrupted without reported test failures. The modules ran independently and
+   passed 4 and 13 tests in final focused runs.
+3. Ruff reported initial import-order findings in the new router/test modules. Imports were corrected
+   before the final lint run.
+4. The known repository-wide formatting difference in `backend/app/ingestion/rss_client.py` remains
+   untouched.
+
+### Exact verification commands and observed results
+
+```bash
+pytest -q backend/tests/test_event_score_schemas.py
+# 4 passed in 0.34s
+
+pytest -q backend/tests/test_event_scores_api.py
+# 13 passed in 1.37s
+
+pytest -q <four explicit Phase 9B failure/rollback tests>
+# 4 passed in 0.90s
+
+pytest -q <three explicit Phase 9B latest/history tests>
+# 3 passed in 0.68s
+
+pytest -q backend/tests/test_event_scores_api.py::test_get_query_counts_are_bounded_and_endpoints_do_not_write
+# 1 passed in 0.68s
+
+pytest -q backend/tests/test_event_scoring.py backend/tests/test_event_scoring_service.py
+# 30 passed in 0.75s
+
+pytest -q backend/tests/test_event_schemas.py backend/tests/test_events_api.py
+# 25 passed in 1.58s
+
+pytest -q backend/tests/test_indicator_score_schemas.py backend/tests/test_indicator_scores_api.py
+# 24 passed in 1.32s
+
+pytest -q backend/tests/test_cve_correlation_service.py backend/tests/test_cve_correlation_backfill.py
+# 23 passed in 0.86s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_event_scores_api_postgres.py
+# 1 passed in 1.62s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_cve_correlation_backfill_postgres.py \
+  backend/tests/test_cve_correlation_postgres.py \
+  backend/tests/test_event_scores_api_postgres.py \
+  backend/tests/test_event_scoring_postgres.py \
+  backend/tests/test_events_api_postgres.py \
+  backend/tests/test_indicator_scoring_postgres.py \
+  backend/tests/test_indicator_scores_api_postgres.py \
+  backend/tests/test_phase6b_postgres_migration.py
+# 9 passed in 4.64s
+
+pytest -q
+# 447 passed, 9 skipped in 8.93s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q
+# 456 passed in 12.82s
+
+ruff check backend/app backend/tests alembic/versions alembic/env.py
+# All checks passed.
+
+ruff format --check <seven Phase 9B Python files>
+# 7 files already formatted.
+
+black --check <each of the seven Phase 9B Python files, serially>
+# Each file would be left unchanged.
+
+mypy backend
+# Success: no issues found in 116 source files.
+
+python -m compileall -q backend/app backend/tests alembic
+# Exit 0 with no output.
+
+git diff --check
+# Exit 0 before documentation append; repeated after the final diff.
+
+ruff format --check backend/app backend/tests alembic/versions alembic/env.py
+# 124 files already formatted; only the known unrelated rss_client.py would be reformatted.
+```
+
+The two interrupted combined runs and the initial 9-pass/4-failure development run are not claimed
+as passing checks. All final focused and full-suite results above were observed directly.
+
+### PostgreSQL isolation and development database
+
+Administrative exact-name queries before and after returned zero databases named
+`threatlens_phase6b_test`. Only `OwnedDisposablePostgres` created and marked that exact database,
+validated ownership, and removed it through guarded cleanup. No manual create, drop, truncate,
+rename, schema cleanup, wildcard, fallback deletion, or volume operation occurred.
+
+Read-only development transactions before and after PostgreSQL validation both returned:
+
+```text
+current_database      = threatlens
+raw_articles          = 222
+indicators            = 1169
+article_indicators    = 34271
+indicator_enrichments = 141
+epss_history          = 168
+correlated_events     = 0
+event_articles        = 0
+event_indicators      = 0
+score_history         = 1
+```
+
+Both ended with rollback. Development data was neither tested against nor changed during the
+validation window.
+
+### Remaining limitations and summary
+
+Event-score list filtering, scoring CLI/backfill, automatic scoring, Celery tasks/schedules,
+correlation changes, indicator-formula changes, provider calls, non-CVE/campaign scoring,
+authentication, dashboards, reports, and notifications remain deferred.
+
+Summary: Phase 9B adds typed POST/latest/history event-score endpoints, safe deterministic
+components, reusable/forced calculation contexts, one-commit transaction ownership, stable errors,
+bounded reads, OpenAPI/route verification, and a real concurrent PostgreSQL POST test. Final suites
+passed 447 tests with 9 PostgreSQL-only skips portably and all 456 tests with PostgreSQL. No schema,
+correlation, indicator scoring, enrichment, or development data changed; nothing was staged,
+committed, or pushed.
+Final visible working diff (including preserved Phase 9A leftovers): 12 files, 2,538 additions,
+and 1 deletion.
+
+## Phase 9C — Bounded Dry-Run/Apply Event-Scoring Backfill — 2026-09-15
+
+### What was implemented and why
+
+Phase 9C adds one bounded operator-controlled page around the existing Phase 9A event-score service.
+The command defaults to a rollback-only dry-run and requires `--apply` before it can commit. It
+selects exact-CVE-family candidates in ascending event ID order, supports `--limit` and
+`--after-id`, forecasts the resulting score and score-history create/reuse decision, and reports
+unsupported, malformed, and unscorable candidates separately.
+
+The implementation intentionally calls `calculate_and_persist_event_score` for every scoreable
+candidate in both modes. Dry-run calls it inside a savepoint and rolls that savepoint back after
+capturing immutable scalar results. Apply leaves all rows for the bounded page in the caller-owned
+transaction; the CLI performs one commit only after the page completes. Unexpected failures abort
+and roll back the entire page. The backfill contains no formula, canonical snapshot, component,
+hashing, or uniqueness implementation of its own.
+
+Repeated calls use the latest persisted event score's calculation time as the reusable `as_of`
+context. This prevents the invocation clock alone from creating a new canonical snapshot. Changed
+member/source evidence still changes the Phase 9A snapshot, while concurrent identical calls rely
+on the existing event/formula/evidence-hash uniqueness constraint and narrow conflict recovery.
+
+Candidate selection includes a `cve:` key or `shared-cve` rule. This is broad enough to surface and
+count malformed or unsupported historical exact-CVE candidates but excludes unrelated campaign
+events. Bounds are limit 1–1000 and non-negative `after_id`. The service reads `limit + 1` IDs only
+to calculate `has_more`, returns no more than the requested limit, and never commits.
+
+No correlation, indicator score calculation, enrichment, provider/network client, API, automatic
+hook, task, schedule, deletion, merge, repair, model, migration, or schema change was added.
+
+### Files created or modified and purpose
+
+- `backend/app/services/event_scoring_backfill.py`: bounded service, immutable result contracts,
+  ordered candidate query, typed classification, rollback-only dry-run, single-page CLI, bounds,
+  JSON output, and atomic transaction boundary.
+- `backend/tests/test_event_scoring_backfill.py`: ten portable tests for create/reuse forecasts,
+  no durable dry-run writes, exact numeric output, ascending bounded paging, cursor behavior,
+  classifications, unrelated exclusion, repeated idempotency, caller rollback, default/explicit CLI
+  modes, unsafe bounds, unexpected-error rollback, and prohibited service calls.
+- `backend/tests/test_event_scoring_backfill_postgres.py`: one protected integration test for dry-run
+  and two simultaneous apply sessions, including one score row, unique components, reuse, and
+  preservation of unrelated caller inserts.
+- `docs/architecture.md`: appended Phase 9C service, selection, transaction, idempotency, result, and
+  scope contracts without reorganizing the existing document.
+- `Phase9C_Event_Scoring_Backfill.md`: focused implementation/operator guide explaining every file,
+  interface, CLI use, actual verification, database safety, and deferred work.
+- `notes.md`: this append-only development record.
+
+The previously modified `docs/architecture.md`/`notes.md` and untracked Phase 9A/9B guide files were
+already present at task start and were preserved. Phase 9C did not modify any Phase 9A/9B API,
+formula, persistence, database model, migration, ingestion, or provider file.
+
+### Service and CLI behavior
+
+```text
+backfill_event_scores(session, *, apply, limit=100, after_id=0, as_of)
+    -> EventScoreBackfillResult
+
+PYTHONPATH=backend python -m app.services.event_scoring_backfill
+PYTHONPATH=backend python -m app.services.event_scoring_backfill --dry-run --limit 100 --after-id 0
+PYTHONPATH=backend python -m app.services.event_scoring_backfill --apply --limit 100 --after-id 0
+```
+
+The result includes mode, requested bounds, scanned/scoreable/classification counts, first and last
+scanned IDs, continuation state, create/reuse forecast and applied counts, and ordered item details.
+Scoreable items contain the score, severity, formula version, and evidence hash returned by the
+existing orchestration. Dry-run never commits; apply commits exactly one successfully completed
+page. Operators must deliberately invoke the next page using the returned cursor.
+
+### Problems encountered and resolutions
+
+1. An initial focused regression command named a nonexistent `test_cve_correlation.py`; pytest
+   stopped before collection. The verified filename is `test_cve_correlation_service.py`, and the
+   corrected focused command passed 105 tests.
+2. Two combined PostgreSQL attempts inside the restricted sandbox produced ten setup errors each
+   because psycopg could not connect to the local administrative database. The container itself was
+   healthy and accepting connections. The identical command was rerun with approved local database
+   access and all ten tests passed. These setup errors are recorded, not presented as product test
+   failures or passing checks.
+3. Black's multi-file check first failed because its multiprocessing listener is prohibited by the
+   sandbox. A serial check then showed one nested conditional formatting difference from Ruff. The
+   outcome selection was rewritten as a clear `if/else`, after which both formatters passed the
+   focused files.
+4. The repository-wide Ruff format check still identifies the known unrelated
+   `backend/app/ingestion/rss_client.py`. It was not changed.
+
+### Exact verification commands and observed results
+
+```bash
+pytest -vv backend/tests/test_event_scoring_backfill.py
+# 10 passed in 1.10s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -vv backend/tests/test_event_scoring_backfill_postgres.py
+# 1 passed in 1.74s
+
+pytest -q backend/tests/test_event_scoring.py backend/tests/test_event_scoring_service.py \
+  backend/tests/test_event_score_schemas.py backend/tests/test_event_scores_api.py \
+  backend/tests/test_event_schemas.py backend/tests/test_events_api.py \
+  backend/tests/test_cve_correlation_service.py backend/tests/test_cve_correlation_backfill.py \
+  backend/tests/test_event_scoring_backfill.py
+# 105 passed in 3.42s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_cve_correlation_backfill_postgres.py \
+  backend/tests/test_cve_correlation_postgres.py \
+  backend/tests/test_event_scores_api_postgres.py \
+  backend/tests/test_event_scoring_backfill_postgres.py \
+  backend/tests/test_event_scoring_postgres.py \
+  backend/tests/test_events_api_postgres.py \
+  backend/tests/test_indicator_scoring_postgres.py \
+  backend/tests/test_indicator_scores_api_postgres.py \
+  backend/tests/test_phase6b_postgres_migration.py
+# 10 passed in 4.20s with approved local PostgreSQL access.
+
+pytest -q
+# 457 passed, 10 skipped in 9.39s.
+# The skipped items are the environment-gated PostgreSQL tests.
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q
+# 467 passed in 13.27s.
+
+ruff check .
+# All checks passed.
+
+ruff format --check backend/app/services/event_scoring_backfill.py \
+  backend/tests/test_event_scoring_backfill.py \
+  backend/tests/test_event_scoring_backfill_postgres.py
+# 3 files already formatted before the small conditional refactor; repeated below after all edits.
+
+black --check --no-cache <each of the three Phase 9C Python files separately>
+# Two files initially passed; the service reported one conditional layout difference.
+# The conditional was refactored and the final serial check is recorded below.
+
+mypy backend
+# Success: no issues found in 119 source files.
+
+python -m compileall -q backend
+# Exit 0 with no output.
+
+ruff format --check .
+# 128 files already formatted; only unrelated backend/app/ingestion/rss_client.py would reformat.
+```
+
+Observed non-passing setup/check attempts are deliberately included above and are not counted as
+passes. Final post-documentation focused tests, format checks, CLI help, `git diff --check`, and diff
+summary are appended to the end of this section after they are run.
+
+### PostgreSQL isolation and development-database checks
+
+An administrative exact-name query returned zero databases named `threatlens_phase6b_test` before
+the PostgreSQL runs. Each successful test invocation used only `OwnedDisposablePostgres`, which
+created the exact disposable database, stored and validated its ownership marker, and removed it
+through guarded cleanup. No manual create/drop/truncate/rename/schema cleanup, wildcard, fallback
+deletion, or volume operation was performed. The exact-name query returned zero after validation.
+
+Read-only development transactions before and after successful PostgreSQL validation observed
+identical values:
+
+```text
+current_database      = threatlens
+raw_articles          = 246
+indicators            = 1223
+article_indicators    = 37451
+indicator_enrichments = 144
+epss_history          = 256
+correlated_events     = 0
+event_articles        = 0
+event_indicators      = 0
+score_history         = 1
+```
+
+Both checks ended in `ROLLBACK`. The development database was not selected as a test target and was
+not mutated by Phase 9C validation.
+
+### Remaining work and next recommended increment
+
+Phase 9C intentionally leaves scheduling/Celery, an API trigger, automatic hooks, event-list score
+filters, non-CVE or campaign scoring, indicator-score refresh, correlation, enrichment, provider
+access, dashboards, reports, authentication, and notifications unfinished. A future increment can
+add an explicitly scheduled operator workflow around this bounded command without changing its
+one-page transaction contract.
+
+### Final post-documentation verification
+
+```bash
+pytest -q backend/tests/test_event_scoring_backfill.py
+# 10 passed in 0.89s.
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_event_scoring_backfill_postgres.py
+# 1 passed in 1.32s.
+
+ruff check .
+# All checks passed.
+
+ruff format --check <the three Phase 9C Python files>
+# 3 files already formatted.
+
+black --check --no-cache <each Phase 9C Python file separately>
+# Each of the 3 files would be left unchanged.
+
+mypy backend
+# Success: no issues found in 119 source files.
+
+python -m compileall -q backend
+# Exit 0 with no output.
+
+PYTHONPATH=backend python -m app.services.event_scoring_backfill --help
+# Exit 0; help showed dry-run/apply, limit, and after-id options.
+
+git diff --check
+# Exit 0 with no output before this final notes append; repeated afterward.
+```
+
+The final PostgreSQL cleanup query again returned zero exact databases named
+`threatlens_phase6b_test`. The final read-only development query returned the same counts documented
+above and rolled back.
+
+Final visible working tree: 8 modified/untracked files, 2,448 additions, and 1 deletion, including
+the preserved earlier Phase 9A/9B documentation. No file is staged.
+
+Summary: Phase 9C adds a default-safe dry-run and explicit-apply exact-CVE event-score backfill,
+bounded ascending cursor pages, exact create/reuse forecasts, separate data-quality counts, atomic
+caller-owned persistence, and protected concurrent PostgreSQL coverage. Focused tests passed 10
+portable and 1 PostgreSQL test; regression/full runs passed 105, 457 portable, and 467 with
+PostgreSQL. No schema, correlation, indicator scoring, enrichment, network path, or development data
+changed. Scheduling and non-CVE scoring remain unfinished; nothing was staged, committed, or pushed.

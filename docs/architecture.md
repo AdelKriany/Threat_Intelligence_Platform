@@ -564,4 +564,200 @@ deadlock, and preservation of unrelated caller work.
 
 Non-CVE correlation, fuzzy/title similarity, shared network indicators, embeddings, actor/malware
 matching, campaign inference, automatic ingestion hooks, backfill tooling, event scoring, and an
-event API remain intentionally deferred.
+event API were outside the Phase 7A service boundary.
+
+## Phase 8 correlated-event REST API
+
+Phase 8 exposes persisted correlated events through a typed, synchronous, read-only FastAPI
+router. The router is registered under `/api/v1`; it never invokes correlation, the Phase 7B
+backfill, scoring, enrichment providers, or transaction commits. The existing Phase 6B schema and
+indexes support the verified query shapes, so Phase 8 adds no migration or speculative index.
+
+| Endpoint | Ordering | Purpose |
+| --- | --- | --- |
+| `GET /api/v1/events` | `updated_at DESC, id DESC` | Filtered, bounded event list |
+| `GET /api/v1/events/{event_id}` | n/a | Event metadata and aggregate relationship counts |
+| `GET /api/v1/events/{event_id}/articles` | `COALESCE(published_at, fetched_at) DESC, id DESC` | Bounded supporting-article page |
+| `GET /api/v1/events/{event_id}/indicators` | `indicator_type, indicator_value, id` | Bounded linked-indicator page |
+
+Every collection uses `limit` (default 20, range 1–100), `offset` (default 0, minimum 0),
+and a total calculated in SQL. Event list filters are optional and conjunctive:
+
+- `cve` is an exact, validator-approved canonical uppercase CVE;
+- `source_name` is an exact match against linked articles;
+- `updated_from` and `updated_to` are inclusive timezone-aware bounds, and the lower bound may not
+  exceed the upper bound.
+
+Event filters use correlated `EXISTS` predicates rather than relationship joins, so multiple
+matching articles cannot duplicate an event or inflate the total. Invalid/noncanonical CVEs return
+`422 INVALID_CVE_FILTER`. Naive timestamps or reversed bounds return
+`422 INVALID_EVENT_FILTER`. Normal FastAPI path and pagination validation remains `422`. Missing
+detail or relationship targets return the safe `404 EVENT_NOT_FOUND` response.
+
+List items and detail expose the stable key, title, correlation rule/version, UTC created/updated
+timestamps, SQL-derived article and indicator counts, and an optional latest persisted event-score
+summary. Detail deliberately does not embed either relationship collection. Article items expose
+stored normalized metadata plus relationship provenance, never `raw_content`. Article recency uses
+`published_at` whenever present and otherwise falls back to `fetched_at`; the article ID breaks
+ties. Stored comma-separated categories are returned as a trimmed list.
+
+Indicator items expose canonical identity, creation time, relationship provenance, and an optional
+latest persisted indicator-score summary. Event and indicator score summaries contain only score,
+severity, formula version, and calculation time. Window-ranked score subqueries select exactly one
+persisted row per target by `calculated_at DESC, id DESC`; the API never calculates a score and
+never exposes canonical evidence, evidence hashes, components, enrichment payloads, or provider
+responses.
+
+The list performs two SELECTs: one filtered count and one page projection. Detail performs one.
+Each relationship endpoint performs two: one event-existence/total query and one page query.
+Grouped count subqueries and window-ranked latest-score subqueries keep these counts independent of
+page size and avoid N+1 access.
+
+Event-score calculation, event-score persistence orchestration, score/severity event-list filters,
+write endpoints, automatic correlation, authentication, dashboards, and non-CVE or approximate
+correlation remain deferred. Score filtering is intentionally absent until event-score semantics
+are implemented and specified.
+
+## Phase 9A Event Formula v1
+
+Phase 9A implements synchronous, explainable scoring only for the exact-CVE events created by
+`shared-cve:v1`. The supported invariant is one canonical uppercase CVE relationship matching
+`event_key = cve:<CVE>`. Missing events, unsupported rules, invalid keys, absent relationships,
+multiple CVE relationships, key/relationship disagreement, and invalid stored member scores fail
+with distinct typed errors. Historical inconsistencies are reported and never repaired by scoring.
+
+The formula version is `phase9a-event-v1`:
+
+```text
+member contribution = latest persisted matching CVE indicator score * 0.90
+source ratio         = min(max(distinct normalized sources - 1, 0), 4) / 4
+source contribution  = source ratio * 10
+event score          = member contribution + source contribution
+```
+
+All arithmetic is `Decimal`; the sum is clamped to `0.00..100.00`, rounded once with
+`ROUND_HALF_UP`, and classified with the existing severity thresholds. The member row is selected
+only from `target_kind = indicator`, ordered by `calculated_at DESC, id DESC`. Its persisted score
+is the input: event scoring neither calculates an indicator score nor reads enrichment/provider
+rows. A missing member row contributes zero and produces an explicit warning, while source-only
+scoring remains valid.
+
+Article source names are loaded through `event_articles`, with null and blank values excluded.
+The shared normalization trims, collapses internal whitespace, case-folds, de-duplicates, and
+sorts names. Consequently 0/1 sources add 0, 2 add 2.5, 3 add 5, 4 add 7.5, and 5 or more add 10.
+
+The canonical evidence document contains the event ID/key/rule, event formula version, canonical
+CVE indicator ID/value, `as_of`, sorted normalized sources, and either an explicit missing-member
+state or the latest member score-history ID, indicator ID, score, severity, indicator formula,
+indicator evidence hash, and calculation time. It excludes the final event score/severity,
+normalized ratios, contributions, full indicator evidence, provider responses, credentials, and
+ORM instances. Strict sorted compact UTF-8 JSON is hashed with SHA-256; the stored JSON and hash
+come from the same canonical bytes. Result serialization is deterministic but is explicitly not
+evidence-hash serialization.
+
+```text
+calculate_and_persist_event_score(session, event_id, *, as_of) -> PersistedEventScore
+```
+
+The service loads trusted rows, creates the snapshot, invokes the pure engine, and inserts one
+event `score_history` row plus two ordered component rows. It flushes but never commits; caller
+rollback removes the operation. Identical `(event_id, formula_version, evidence_hash)` evidence is
+reused, while changed member score, source set, or `as_of` appends history. A savepoint handles only
+the named event-evidence uniqueness race, then re-queries the winning row; unrelated integrity
+errors propagate and unrelated outer-transaction work is preserved.
+
+No schema, API, correlation, indicator-scoring, CLI, backfill, task, schedule, provider, dashboard,
+authentication, filter, override, or non-CVE/campaign behavior is added. The existing Phase 8 API
+continues to read the latest persisted event-score summary without a new endpoint.
+
+## Phase 9B event-scoring REST API
+
+Phase 9B exposes the Phase 9A synchronous service through three typed endpoints under the existing
+`/api/v1/events` namespace:
+
+| Method and path | Success | Behavior |
+| --- | --- | --- |
+| `POST /api/v1/events/{event_id}/score` | `200` | Calculate from stored evidence and create or reuse the canonical score |
+| `GET /api/v1/events/{event_id}/score` | `200` | Return the latest persisted event score without calculation |
+| `GET /api/v1/events/{event_id}/score/history` | `200` | Return a bounded newest-first persisted history page |
+
+The router is a transaction and error-mapping boundary. It does not duplicate formula,
+normalization, snapshot, hashing, component, or uniqueness logic. POST delegates exclusively to
+`calculate_and_persist_event_score`, constructs the complete typed response, and commits exactly
+once. Any failure rolls back. Phase 9A continues to flush without owning the outer transaction, and
+its narrowly scoped savepoint preserves unrelated caller work during an event-evidence uniqueness
+race.
+
+POST accepts only `force_refresh` (Boolean, default `false`). The default uses the latest persisted
+event score's `calculated_at` as the reusable `as_of` context; when no prior score exists it uses
+current UTC. Portable database timestamps are normalized to UTC, and an invalid reusable context is
+retried once at current UTC through the same Phase 9A service. `force_refresh=true` uses current UTC
+immediately. It does not bypass the evidence hash: two calls with the same current timestamp and
+evidence can still reuse one row. Neither mode runs correlation, backfill, indicator scoring,
+enrichment, provider clients, or network requests.
+
+Latest and history select only rows with `target_kind='event'`, the requested `event_id`, and a null
+`indicator_id`. Ordering is `calculated_at DESC, id DESC`. History accepts `limit` 1–100 (default
+20) and non-negative `offset` (default 0), with its total calculated in SQL. An existing event with
+no history returns an empty history page; latest instead returns `404 EVENT_SCORE_NOT_FOUND`.
+Missing events return `404 EVENT_NOT_FOUND`.
+
+Responses expose score-history ID, event ID/key/title, score, severity, event formula, evidence
+hash, `as_of`, calculation time, and ordered safe components. Components follow the fixed Phase 9A
+profile (`member_indicator_score`, `independent_sources`) and include safe raw/normalized input,
+weight, contribution, freshness multiplier, evidence status, optional provider/evidence timestamp,
+and explanation. A missing member is represented as `status='missing'`. Decimal JSON output follows
+the established numeric API representation and timestamps are UTC. Canonical event/member evidence,
+raw enrichment/provider responses, credentials, and internal exception details are excluded.
+
+Stored exact-CVE structures rejected by Phase 9A map to `422 EVENT_UNSCORABLE`, including invalid
+keys, unsupported rules, missing/ambiguous/inconsistent CVE relationships, invalid member-score
+evidence, and typed scoring-input failures. Expected errors use the centralized safe error schema;
+unexpected failures retain the sanitized 500 handler. Normal FastAPI path/query validation remains
+422, and event IDs must be positive.
+
+Latest performs two SELECTs (score/event plus components). History performs three (event plus SQL
+total, bounded history page, and page components). These counts remain fixed as component/history
+page size grows. The score router is registered before the existing Phase 8 event router; complete
+path matching and OpenAPI tests verify that `/{event_id}` does not capture `/score` or
+`/score/history`.
+
+No migration, event-list score filter, scoring backfill/CLI, automatic hook, task/schedule,
+correlation change, indicator-formula change, provider call, authentication, dashboard, notification,
+or non-CVE event scoring is introduced.
+
+## Phase 9C bounded event-scoring backfill
+
+Phase 9C adds a synchronous, one-page command and service for forecasting or persisting scores of
+exact-CVE event candidates. It reuses the Phase 9A schema and orchestration; no model or migration
+changes. Candidate events are selected by `id > after_id`, ordered by ID ascending, and capped by
+`limit` (default 100, allowed 1–1000). One extra ID is read only to determine `has_more` and the
+result exposes `next_after_id` when another page exists.
+
+```text
+backfill_event_scores(session, *, apply, limit=100, after_id=0, as_of)
+    -> EventScoreBackfillResult
+```
+
+Dry-run is the default CLI mode. Each candidate is delegated to
+`calculate_and_persist_event_score`; a rollback-only savepoint lets the same persistence path
+produce an exact create/reuse forecast without durable score or component writes. Apply mode leaves
+the bounded page in the caller's transaction, and the CLI commits exactly once only after the whole
+page succeeds. Unexpected errors roll back the page. Typed unsupported, malformed, and unscorable
+conditions are counted separately and do not become generic failures.
+
+The latest persisted event-score calculation time is reused as the event's `as_of` context when
+available. Thus unchanged evidence reuses the same canonical row during later or concurrent runs;
+changed evidence still appends history. Phase 9A's event-evidence uniqueness constraint and narrowly
+scoped savepoint remain the sole concurrency mechanism. The backfill does not duplicate scoring,
+snapshot, hash, component, or conflict logic.
+
+Candidate selection admits rows with a `cve:` event key or `shared-cve` rule so malformed and
+unsupported historical members of the exact-CVE family remain observable in the result. Unrelated
+campaign events are excluded. Results contain ordered item outcomes, score/severity/formula/hash for
+scoreable rows, cursor metadata, and create/reuse forecasts and applied counts.
+
+The command processes one page and exits. It never invokes correlation, indicator scoring,
+enrichment, providers, or network clients, and it never merges, deletes, or repairs existing data.
+There is no API, task, schedule, automatic hook, non-CVE scoring behavior, event-score filter, or
+schema addition in this increment.
