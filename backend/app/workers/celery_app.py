@@ -13,7 +13,10 @@ celery_app.conf.update(
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,
-    imports=("app.ingestion.enrichment.tasks",),
+    imports=(
+        "app.ingestion.enrichment.tasks",
+        "app.workers.event_scoring_tasks",
+    ),
 )
 
 celery_app.autodiscover_tasks(["app"], related_name="scheduler")
@@ -25,6 +28,15 @@ def configure_beat_schedule() -> None:
     from app.ingestion.scheduler import build_beat_schedule
 
     celery_app.conf.beat_schedule = build_beat_schedule()
+    if settings.event_scoring_schedule_enabled:
+        celery_app.conf.beat_schedule["score-exact-cve-events"] = {
+            "task": "app.workers.event_scoring_tasks.score_event_page_task",
+            "schedule": settings.event_scoring_schedule_interval_minutes * 60,
+            "kwargs": {
+                "limit": settings.event_scoring_page_limit,
+                "after_id": 0,
+            },
+        }
     if settings.enrichment_enabled:
         celery_app.conf.beat_schedule["refresh-expired-enrichments"] = {
             "task": "app.ingestion.enrichment.tasks.enrich_pending_batch_task",
