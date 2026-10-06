@@ -837,3 +837,36 @@ Scheduling is disabled by default and requires `INDICATOR_SCORING_SCHEDULE_ENABL
 interval defaults to 60 minutes and page size to 100. A crash after commit but before successor
 publication is recovered by the next periodic root because completed pages are idempotent. No
 outbox or workflow table is introduced in this phase.
+
+## Phase 10B scheduled exact-CVE correlation
+
+Phase 10B wraps the existing Phase 7B bounded exact-CVE correlation backfill in an opt-in Celery
+workflow. Correlation rules, event keys, titles, relationship metadata, queries, uniqueness handling,
+and persistence remain unchanged. No model or migration is added.
+
+```text
+Beat root (after_id=0)
+  -> acquire cve-correlation-backfill lock
+  -> open one SessionLocal
+  -> backfill_cve_correlations(apply=True, limit, after_id, as_of)
+  -> commit one complete page
+  -> release lock
+  -> enqueue next_after_id only after commit
+```
+
+One task invocation owns one page and one transaction. Failed pages roll back, release the lock,
+propagate the unexpected exception to Celery, and do not publish a successor. Lock contention skips
+before a database session opens. A final page commits without publishing another task.
+
+The root selects one UTC correlation timestamp and passes its ISO value to every successor. Each
+page continues to scan canonical CVE indicators by ascending ID with the existing 1-1000 bound.
+Invalid CVEs are counted and skipped; non-CVE indicators are excluded. Existing exact-CVE events and
+links are reused while newly discovered article relationships are added by the Phase 7 service.
+
+Scheduling is disabled by default and requires `CVE_CORRELATION_SCHEDULE_ENABLED=true`. The interval
+defaults to 60 minutes and page size to 100. Publication occurs after commit, leaving the same narrow
+commit-to-enqueue recovery window as the scoring workflows. A later periodic root safely replays
+completed pages through the existing event and relationship uniqueness constraints.
+
+Phase 10B never invokes indicator scoring, event scoring, enrichment, providers, network clients, or
+API handlers. Cross-stage sequencing and a durable pipeline coordinator remain Phase 10C work.

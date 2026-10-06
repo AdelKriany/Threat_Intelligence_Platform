@@ -2765,3 +2765,157 @@ with PostgreSQL. No schema or scoring semantics changed; Phase 10B correlation s
 
 Phase 10A working diff: 11 files and 1472 additions. Nothing was staged or committed; unrelated
 untracked Graphify, Obsidian, personal workspace, and `future_plan.pdf` files were preserved.
+
+## Phase 10B - Scheduled Exact-CVE Correlation - 2026-10-07
+
+### What was implemented and why
+
+Phase 10B adds disabled-by-default Celery scheduling to the existing Phase 7B bounded exact-CVE
+correlation backfill. The task applies one page in one transaction, holds the existing Redis token
+lock pattern during database work, commits once, releases the lock, and publishes one continuation
+only after commit. Correlation semantics and schema remain unchanged.
+
+### Files and purpose
+
+- `backend/app/workers/cve_correlation_tasks.py`: one-page task, Redis lock, transaction ownership,
+  stable sweep timestamp, and post-commit continuation.
+- `backend/app/core/config.py`: validated enable, interval, and page-limit settings.
+- `backend/app/workers/celery_app.py`: task import and optional Beat entry.
+- `docker-compose.yml`: passes Phase 10B configuration to Beat.
+- `backend/tests/test_cve_correlation_tasks.py`: seven focused transaction, lock, continuation,
+  registration, schedule, input, and delegation tests.
+- `docs/architecture.md`: Phase 10B execution and recovery contract.
+- `Phase10B_Scheduled_Exact_CVE_Correlation.md`: operator and implementation guide.
+- `notes.md`: this append-only record.
+
+### Interface and behavior
+
+```text
+correlate_cve_page_task(limit=100, after_id=0, as_of=None) -> JSON-safe dict
+```
+
+The task calls `backfill_cve_correlations(..., apply=True)` directly rather than invoking the CLI.
+Each invocation owns one `SessionLocal`, one bounded page, and one commit. Invalid timestamps fail
+before lock acquisition. Lock contention skips before opening a database session. Failures roll back,
+release the lock, propagate to Celery, and do not continue. A successful non-final page publishes
+the next cursor after commit with the root sweep's stable UTC timestamp.
+
+Configuration defaults are:
+
+```text
+CVE_CORRELATION_SCHEDULE_ENABLED=false
+CVE_CORRELATION_SCHEDULE_INTERVAL_MINUTES=60
+CVE_CORRELATION_PAGE_LIMIT=100
+```
+
+### Design decisions and scope boundaries
+
+1. Phase 10B reuses the existing backfill and `correlate_cve_indicator`; it does not duplicate event
+   planning, relationship creation, validation, or uniqueness logic.
+2. Database constraints remain authoritative for concurrency. The Redis lock reduces overlapping
+   scheduled work but is not a correctness substitute.
+3. Post-commit continuation preserves one-page atomicity. The next periodic root recovers the narrow
+   commit-to-enqueue crash window through idempotent replay.
+4. The task never runs enrichment, indicator scoring, event scoring, providers, APIs, or network
+   requests. Cross-stage ordering remains Phase 10C.
+5. No migration, cursor table, outbox, new correlation signal, or automatic schedule enablement was
+   introduced.
+
+### Problems encountered and resolutions
+
+One deliberately combined PostgreSQL command listed the service concurrency test before the
+backfill concurrency test. The service test left a valid event in the session-scoped fixture, while
+the older backfill test assumes an empty database and starts at `after_id=0`; the result was one pass
+and one failure (`events_would_create` was 1 rather than 2). Running the same files in normal
+repository order passed both tests, and the complete PostgreSQL suite passed all 497 tests. This is
+an existing test-order isolation limitation; Phase 10B production or test code was not altered to
+mask it.
+
+### Exact verification commands and observed results
+
+```bash
+pytest -q backend/tests/test_cve_correlation_service.py \
+  backend/tests/test_cve_correlation_backfill.py \
+  backend/tests/test_cve_correlation_tasks.py
+# 30 passed in 1.38s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_cve_correlation_postgres.py \
+  backend/tests/test_cve_correlation_backfill_postgres.py
+# 1 passed, 1 failed in 1.82s due to the existing file-order assumption described above.
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_cve_correlation_backfill_postgres.py \
+  backend/tests/test_cve_correlation_postgres.py
+# 2 passed in 1.57s.
+
+pytest -q
+# 486 passed, 11 skipped in 15.76s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q
+# 497 passed in 14.71s
+
+ruff check .
+# All checks passed.
+
+ruff format --check backend/app/workers/cve_correlation_tasks.py \
+  backend/app/core/config.py backend/app/workers/celery_app.py \
+  backend/tests/test_cve_correlation_tasks.py
+# 4 files already formatted.
+
+black --check --no-cache --workers 1 <the same four Python files>
+# Exit 0 with no output.
+
+mypy backend
+# Success: no issues found in 128 source files.
+
+python -m compileall -q backend
+# Exit 0 with no output.
+
+docker compose config --quiet
+# Exit 0 with no output.
+
+git diff --check
+# Exit 0 with no output.
+
+docker compose exec -T celery-worker \
+  celery -A app.workers.celery_app inspect registered --timeout 10
+# One worker online; correlate_cve_page_task registered.
+
+docker compose exec -T celery-beat python -c '<inspect default schedule>'
+# correlate-canonical-cves present=False.
+
+docker compose exec -T -e CVE_CORRELATION_SCHEDULE_ENABLED=true \
+  -e CVE_CORRELATION_SCHEDULE_INTERVAL_MINUTES=20 \
+  -e CVE_CORRELATION_PAGE_LIMIT=50 celery-beat python -c '<inspect enabled schedule>'
+# task=correlate_cve_page_task, schedule=1200, kwargs={limit: 50, after_id: 0}.
+```
+
+### PostgreSQL isolation and development database observation
+
+Only the ownership-validated fixture created and removed `threatlens_phase6b_test`. The final
+administrative exact-name query returned zero matching databases. No database was manually created,
+dropped, truncated, or cleaned, and no Docker volume operation was used.
+
+A read-only transaction observed development database `threatlens` with 428 raw articles, 2023
+indicators, 65530 article-indicator links, 234 enrichments, 519 EPSS rows, zero correlated events,
+zero event-article links, zero event-indicator links, and one score-history row, then rolled back. No
+before-count was captured in this increment, so these are final observations rather than an
+unchanged-count claim. The Phase 10B schedule remained disabled and performed no development writes.
+
+### Remaining work and summary
+
+Phase 10B intentionally does not coordinate pipeline stages. Phase 10C should sequence enrichment,
+indicator scoring, exact-CVE correlation, and event scoring while preserving each stage's bounded
+transaction and retry boundary.
+
+Summary: Phase 10B adds a disabled-by-default exact-CVE correlation schedule, one-page atomic Celery
+execution, Redis serialization, stable sweep timestamps, post-commit cursor continuation, seven
+focused task tests, protected concurrency regression coverage, and live worker/Beat verification.
+Final validation passed 30 focused portable tests, two focused PostgreSQL tests in normal order, 486
+portable tests with 11 skips, and 497 tests with PostgreSQL. No schema or correlation semantics
+changed; Phase 10C workflow coordination remains.
+
+Phase 10B working diff: 8 files and 672 additions. Nothing was staged or committed; unrelated
+untracked Graphify, Obsidian, personal workspace, and `future_plan.pdf` files were preserved.

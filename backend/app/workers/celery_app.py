@@ -15,6 +15,7 @@ celery_app.conf.update(
     enable_utc=True,
     imports=(
         "app.ingestion.enrichment.tasks",
+        "app.workers.cve_correlation_tasks",
         "app.workers.indicator_scoring_tasks",
         "app.workers.event_scoring_tasks",
     ),
@@ -35,6 +36,15 @@ def configure_beat_schedule() -> None:
             "schedule": settings.indicator_scoring_schedule_interval_minutes * 60,
             "kwargs": {
                 "limit": settings.indicator_scoring_page_limit,
+                "after_id": 0,
+            },
+        }
+    if settings.cve_correlation_schedule_enabled:
+        celery_app.conf.beat_schedule["correlate-canonical-cves"] = {
+            "task": "app.workers.cve_correlation_tasks.correlate_cve_page_task",
+            "schedule": settings.cve_correlation_schedule_interval_minutes * 60,
+            "kwargs": {
+                "limit": settings.cve_correlation_page_limit,
                 "after_id": 0,
             },
         }

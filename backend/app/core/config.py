@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     indicator_scoring_schedule_enabled: bool = False
     indicator_scoring_schedule_interval_minutes: int = Field(default=60, ge=1)
     indicator_scoring_page_limit: int = Field(default=100, ge=1, le=1000)
+    cve_correlation_schedule_enabled: bool = False
+    cve_correlation_schedule_interval_minutes: int = Field(default=60, ge=1)
+    cve_correlation_page_limit: int = Field(default=100, ge=1, le=1000)
     event_scoring_schedule_enabled: bool = False
     event_scoring_schedule_interval_minutes: int = Field(default=60, ge=1)
     event_scoring_page_limit: int = Field(default=100, ge=1, le=1000)
