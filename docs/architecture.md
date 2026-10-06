@@ -761,3 +761,40 @@ The command processes one page and exits. It never invokes correlation, indicato
 enrichment, providers, or network clients, and it never merges, deletes, or repairs existing data.
 There is no API, task, schedule, automatic hook, non-CVE scoring behavior, event-score filter, or
 schema addition in this increment.
+
+## Phase 9D scheduled event-scoring workflow
+
+Phase 9D wraps the Phase 9C exact-CVE backfill in a Celery task and an opt-in Beat schedule. The
+schedule is disabled by default. Enabling it requires `EVENT_SCORING_SCHEDULE_ENABLED=true`; the
+interval defaults to 60 minutes and the page limit defaults to 100 with the existing 1–1000 bound.
+
+```text
+Beat root (after_id=0)
+  -> acquire global event-scoring task lock
+  -> open one SessionLocal
+  -> backfill_event_scores(apply=True, limit, after_id, as_of)
+  -> commit one complete page
+  -> release lock
+  -> enqueue next_after_id only after commit
+```
+
+One task invocation equals one database transaction and one bounded page. The task never calls the
+Phase 9C CLI because that boundary converts failures to exit codes; it calls the service directly,
+owns commit/rollback, and lets unexpected exceptions reach Celery. Failed pages roll back and do not
+continue. A final page commits without publishing another task.
+
+The first page creates one UTC logical timestamp and passes its ISO value to successors. Existing
+event rows still use Phase 9C's latest persisted calculation context, preserving repeated-run
+idempotency. The existing Redis task lock serializes pages, while the event/formula/evidence-hash
+database constraint remains authoritative for persistence races. Lock contention skips before a
+database session is opened.
+
+Publication of the successor happens after commit. A crash in that narrow gap delays completion
+until the next periodic root; replay from ID zero is safe because completed pages reuse canonical
+scores. Phase 9D does not add an outbox, cursor table, model, migration, new formula, API, provider
+call, correlation path, enrichment path, or indicator-score calculation.
+
+The Celery worker and Beat continue to use Redis as broker/result backend with UTC JSON messages.
+The worker explicitly imports the new task module. Local Compose passes schedule settings only to
+Beat and mounts the backend source into both worker and Beat, ensuring both processes load the same
+task contract.

@@ -2476,3 +2476,129 @@ caller-owned persistence, and protected concurrent PostgreSQL coverage. Focused 
 portable and 1 PostgreSQL test; regression/full runs passed 105, 457 portable, and 467 with
 PostgreSQL. No schema, correlation, indicator scoring, enrichment, network path, or development data
 changed. Scheduling and non-CVE scoring remain unfinished; nothing was staged, committed, or pushed.
+
+## Phase 9D — Scheduled Event-Scoring Workflow — 2026-09-29
+
+### Implementation
+
+Phase 9D adds an explicitly enabled Celery Beat workflow around the unchanged Phase 9C service.
+`score_event_page_task` acquires the existing Redis task lock, opens `SessionLocal`, calls
+`backfill_event_scores(..., apply=True)`, commits exactly once for the page, releases the lock, and
+only then publishes one successor with `next_after_id`. The final page stops. Failures roll back,
+release the lock, propagate to Celery, and never continue.
+
+One logical UTC `as_of` is generated at the root and passed to all successors. Existing events retain
+Phase 9C's latest-score context behavior. No scoring formula, evidence snapshot, persistence service,
+model, migration, correlation, indicator scoring, enrichment provider, API, or network-client logic
+changed.
+
+Scheduling defaults off. The new settings are:
+
+```text
+EVENT_SCORING_SCHEDULE_ENABLED=false
+EVENT_SCORING_SCHEDULE_INTERVAL_MINUTES=60
+EVENT_SCORING_PAGE_LIMIT=100
+```
+
+The limit is validated from 1 through 1000. When enabled, Beat publishes a root at `after_id=0`.
+Replay is safe and recovers a commit-to-enqueue crash without a new outbox or cursor table.
+
+### Files and purpose
+
+- `backend/app/workers/event_scoring_tasks.py`: scheduled one-page task and continuation.
+- `backend/app/core/config.py`: validated Phase 9D settings.
+- `backend/app/workers/celery_app.py`: task import and opt-in Beat entry.
+- `docker-compose.yml`: Beat settings and backend bind mount.
+- `backend/tests/test_event_scoring_tasks.py`: six task/schedule transaction and safety tests.
+- `docs/architecture.md`: Phase 9D architecture contract.
+- `Phase9D_Scheduled_Event_Scoring.md`: focused implementation and operator guide.
+- `notes.md`: this append-only record.
+
+### Problems encountered and resolutions
+
+1. Malformed `as_of` parsing initially occurred after lock acquisition. Parsing was moved before the
+   lock so invalid input cannot strand it; a regression test verifies the lock is never acquired.
+2. The old running Celery Beat container had no backend bind mount and therefore loaded its older
+   image even after restart. Compose already mounted the worker source. The same mount was added to
+   Beat, both Celery containers were recreated, and live checks then observed the current settings.
+3. The initial enabled-schedule probe failed with `KeyError` because that stale Beat container did
+   not contain the new settings. After recreation, the same isolated probe returned the expected
+   task, 900-second interval, limit 40, and cursor zero.
+4. The known repository-wide Ruff formatting difference in
+   `backend/app/ingestion/rss_client.py` remains untouched.
+
+### Exact verification and observed results
+
+```bash
+pytest -q backend/tests/test_event_scoring_tasks.py \
+  backend/tests/test_event_scoring_backfill.py \
+  backend/tests/test_ingestion.py::test_scheduler_builds_beat_schedule \
+  backend/tests/test_phase5_enrichment.py::test_phase5_tasks_and_schedules_are_registered
+# 18 passed in 0.91s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_event_scoring_backfill_postgres.py
+# 1 passed in 1.29s
+
+pytest -q
+# 463 passed, 10 skipped in 9.12s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q
+# 473 passed, 1 warning in 13.79s
+
+ruff check .
+# All checks passed.
+
+ruff format --check backend/app/core/config.py backend/app/workers/celery_app.py \
+  backend/app/workers/event_scoring_tasks.py backend/tests/test_event_scoring_tasks.py
+# 4 files already formatted.
+
+black --check --no-cache <each of the four focused files separately>
+# Each file would be left unchanged.
+
+mypy backend
+# Success: no issues found in 121 source files.
+
+python -m compileall -q backend
+# Exit 0 with no output.
+
+docker compose config --quiet
+# Exit 0 with no output.
+
+docker compose exec -T celery-worker celery -A app.workers.celery_app inspect registered --timeout 10
+# One worker online; app.workers.event_scoring_tasks.score_event_page_task registered.
+
+docker compose exec -T celery-beat python -c '<inspect default schedule>'
+# enabled_by_default=False.
+
+docker compose exec -T -e EVENT_SCORING_SCHEDULE_ENABLED=true \
+  -e EVENT_SCORING_SCHEDULE_INTERVAL_MINUTES=15 \
+  -e EVENT_SCORING_PAGE_LIMIT=40 celery-beat python -c '<inspect enabled schedule>'
+# task=score_event_page_task, schedule=900, kwargs={limit: 40, after_id: 0}.
+```
+
+The full PostgreSQL suite's single warning is the existing Pydantic alias warning from
+`test_event_scores_api_postgres.py`. The repository-wide formatter reported 130 formatted files and
+only the known unrelated `rss_client.py` difference.
+
+The ownership-validated fixture removed `threatlens_phase6b_test`; the final exact-name count was
+zero. A read-only development transaction observed database `threatlens`, 370 raw articles, 1682
+indicators, 55874 article-indicator links, 225 enrichments, 442 EPSS rows, zero correlated events or
+event relationships, and one score-history row, then rolled back. No before-count was taken in this
+increment, so these are final observations rather than an unchanged-count claim. The Phase 9D Beat
+entry remained disabled and did not score development events.
+
+### Remaining limitations and summary
+
+Exactly-once successor publication would require an outbox or workflow table and remains deferred.
+The next periodic root safely recovers a post-commit publication failure. Non-CVE scoring,
+indicator refresh, API filters, dashboards, reports, and notifications remain unfinished.
+
+Summary: Phase 9D adds a disabled-by-default Celery schedule, one-page atomic event-score tasks,
+post-commit cursor continuation, stable sweep timestamps, Redis serialization, Compose runtime
+wiring, six focused tests, and live worker/Beat verification. Final suites passed 463 tests with 10
+PostgreSQL skips portably and 473 tests with PostgreSQL. No schema or scoring semantics changed.
+
+Phase 9D working diff: 8 files, 602 additions, and 1 deletion. Nothing was staged or committed;
+pre-existing untracked Graphify/Obsidian workspace files were preserved and are not part of Phase 9D.
