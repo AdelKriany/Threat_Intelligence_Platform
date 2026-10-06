@@ -18,6 +18,7 @@ celery_app.conf.update(
         "app.workers.cve_correlation_tasks",
         "app.workers.indicator_scoring_tasks",
         "app.workers.event_scoring_tasks",
+        "app.workers.intelligence_workflow_tasks",
     ),
 )
 
@@ -28,6 +29,17 @@ def configure_beat_schedule() -> None:
     """Load the ingestion beat schedule once the Celery app is initialized."""
 
     from app.ingestion.scheduler import build_beat_schedule
+
+    if settings.intelligence_workflow_schedule_enabled:
+        celery_app.conf.beat_schedule = {
+            "run-intelligence-workflow": {
+                "task": (
+                    "app.workers.intelligence_workflow_tasks.start_intelligence_workflow_task"
+                ),
+                "schedule": settings.intelligence_workflow_schedule_interval_minutes * 60,
+            }
+        }
+        return
 
     celery_app.conf.beat_schedule = build_beat_schedule()
     if settings.indicator_scoring_schedule_enabled:

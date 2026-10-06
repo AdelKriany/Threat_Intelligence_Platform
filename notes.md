@@ -2919,3 +2919,236 @@ changed; Phase 10C workflow coordination remains.
 
 Phase 10B working diff: 8 files and 672 additions. Nothing was staged or committed; unrelated
 untracked Graphify, Obsidian, personal workspace, and `future_plan.pdf` files were preserved.
+
+## Phase 10C - Coordinated End-to-End Intelligence Workflow - 2026-10-07
+
+### What was implemented and why
+
+Phase 10C connects the existing ingestion, IOC extraction, enrichment, Formula v1 indicator
+scoring, exact-CVE correlation, and event-scoring stages in one opt-in, recoverable Celery workflow.
+The roadmap requires run identifiers, stage outcomes, cursor progress, terminal failures, safe replay,
+and operational state. No existing table represented that information, so this increment adds one
+narrow durable control-plane table rather than relying on task timing or Redis alone.
+
+The implementation does not change either scoring formula, canonical evidence hashing, enrichment
+provider semantics, exact-CVE event keys, rule metadata, relationship reasons, or domain uniqueness
+handling. It coordinates the existing boundaries and records their progress.
+
+### Files created or modified and purpose
+
+- `alembic/versions/20261007_phase10c_intelligence_workflow.py`: adds and removes only the durable
+  `intelligence_workflow_runs` table, constraints, and status/update index.
+- `alembic/env.py`: loads the workflow model into Alembic metadata.
+- `backend/app/models/intelligence_workflow.py`: ORM mapping for run identity, status, stage, cursor,
+  logical timestamp, page limits, outcomes, failures, and timestamps.
+- `backend/app/models/__init__.py`: exports the new model.
+- `backend/app/services/intelligence_workflow.py`: pure durable state transitions, aggregate counters,
+  cursor validation, narrow conflict recognition, completion, and terminal-failure recording.
+- `backend/app/workers/intelligence_workflow_tasks.py`: start/recovery task and one-stage/page state
+  machine using the existing domain services.
+- `backend/app/ingestion/scheduler.py`: extracts a reusable synchronous ingestion function and lets
+  the coordinator disable immediate enrichment fan-out.
+- `backend/app/ingestion/feed_manager.py`: adds that explicit, default-on dispatch switch without
+  changing standalone ingestion behavior.
+- `backend/app/ingestion/enrichment/service.py`: lets a caller own commit while preserving the old
+  default per-indicator commit behavior.
+- `backend/app/ingestion/enrichment/tasks.py`: exposes the existing bounded pending batch as a shared
+  function and supports an atomic coordinated page.
+- `backend/app/core/config.py`: adds default-off workflow schedule, interval, and retry-delay settings.
+- `backend/app/workers/celery_app.py`: registers the coordinator and makes its Beat schedule exclusive
+  when explicitly enabled.
+- `.env.example`: documents the three Phase 10C settings.
+- `docker-compose.yml`: passes the Phase 10C settings to API, worker, and Beat consistently.
+- `backend/tests/test_intelligence_workflow_tasks.py`: portable workflow, cursor, rollback, lock,
+  schedule, enrichment-page, and real domain-service coverage.
+- `backend/tests/test_phase10c_postgres_migration.py`: protected migration lifecycle, constraints,
+  and concurrent-root idempotency coverage.
+- `docs/architecture.md`: durable execution, transaction, recovery, and scope contract.
+- `Phase10C_Coordinated_Intelligence_Workflow.md`: operator and implementation guide with SQL
+  inspection commands.
+- `notes.md`: this append-only observed implementation record.
+
+### Service and task interface
+
+```text
+start_intelligence_workflow_task(as_of=None) -> structured run state
+advance_intelligence_workflow_task(run_id) -> structured run state
+```
+
+The start task validates or creates one aware UTC logical timestamp, snapshots all page limits,
+creates the one permitted active row, commits, then queues the current page. Concurrent roots either
+return the same active run or create it; only the named active-slot uniqueness violation is handled
+as a duplicate. Unexpected integrity errors propagate.
+
+The advance task executes one stage/page. Successful active runs follow this order:
+
+```text
+ingestion + embedded IOC extraction
+  -> bounded enrichment
+  -> bounded indicator scoring
+  -> bounded exact-CVE correlation
+  -> bounded event scoring
+  -> completed
+```
+
+Each structured result includes run ID/version, overall status, current stage/status, cursor, logical
+timestamp, page-limit snapshot, accumulated stage outcomes, and failure fields. States visible in the
+row include queued, running, skipped, completed, and failed.
+
+### Important design decisions and scope limits
+
+1. One nullable unique `active_slot` is the database-authoritative single-active-run guard. Terminal
+   rows set it to null and remain available as history.
+2. Indicator scoring, correlation, and event scoring use their existing apply backfills. Domain
+   writes, stage counters, and cursor update commit in the same bounded transaction.
+3. Coordinated enrichment keeps the existing selector/providers/upserts but disables internal
+   per-indicator commits and commits the selected page once. Its durable checkpoint follows in a
+   short transaction; replay is safe through current-result selection and unique upserts.
+4. Ingestion retains its established article and indicator transaction boundaries. Its workflow
+   checkpoint is separate; replay is safe through content hashes and canonical indicator/link
+   uniqueness.
+5. Per-article enrichment dispatch is disabled only for coordinated ingestion so the next stage is
+   the sole enrichment owner. Standalone ingestion keeps its prior default behavior.
+6. Every continuation is published after commit. A missed publication is recovered when the next
+   Beat root finds the active row at its saved stage/cursor.
+7. A per-run Redis lock and the existing stage locks reduce duplicate work. Database constraints and
+   idempotent services remain authoritative when Redis fails open. A stale duplicate delivery sees
+   the advanced row and does not turn that harmless race into a workflow failure.
+8. Stage-lock contention is recorded as skipped and retried after the configured delay. Unexpected
+   stage failures roll back, become terminally failed, and do not continue.
+9. When coordinated scheduling is enabled, Beat installs only the workflow root. Separate ingestion,
+   enrichment, indicator-scoring, correlation, and event-scoring schedules are omitted to prevent
+   competing paths.
+10. The schedule remains disabled by default. Phase 10C adds no API, CLI, dashboard, report,
+    notification, cancellation, fuzzy matching, new provider, formula, or correlation signal.
+
+### Problems encountered and resolutions
+
+1. Graphify confirmed that Phase 10A, 10B, and 9D page tasks self-publish their own successors and
+   that no existing persistent workflow/job model could record a cross-stage run. A timing-only
+   Celery chain would have advanced before a complete multi-page stage, so a durable state machine
+   and one narrow migration were used.
+2. The first protected PostgreSQL command could not reach local port 5433 from the restricted
+   sandbox. The identical command was rerun with approved local access; the ownership-validated
+   fixture then passed and removed its database normally.
+3. The first Docker worker/Beat build ended with a build-service EOF. A retry completed the images;
+   overlapping interrupted recreate attempts then returned a container-name conflict even though the
+   intended new containers were already running. Direct container inspection confirmed both were
+   healthy and registered the new tasks.
+4. Docker restarted while building and left the API stopped. Only the API service was restored; its
+   health endpoint returned `{"status":"ok"}`. Coordinated mode stayed disabled and the development
+   workflow migration was not applied.
+5. Repository-wide `ruff format --check backend alembic` reported the unchanged pre-existing
+   `backend/app/ingestion/rss_client.py` as needing formatting. That unrelated file was preserved;
+   the exact 14 Phase 10C Python files passed Ruff formatting.
+6. Black's multi-file fork-server is not permitted in this sandbox. Running Black once per exact
+   Phase 10C file avoided multiprocessing and all 14 files passed.
+
+### Exact verification commands and observed results
+
+```bash
+pytest -q backend/tests/test_ingestion.py backend/tests/test_ioc_enrichment.py \
+  backend/tests/test_phase5_enrichment.py backend/tests/test_indicator_scoring_tasks.py \
+  backend/tests/test_cve_correlation_tasks.py backend/tests/test_event_scoring_tasks.py \
+  backend/tests/test_intelligence_workflow_tasks.py
+# 87 passed in 3.65s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_phase10c_postgres_migration.py
+# 2 passed in 2.03s
+
+pytest -q
+# 494 passed, 13 skipped in 10.76s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q
+# 507 passed in 15.44s
+
+ruff check backend alembic
+# All checks passed.
+
+ruff format --check <the 14 Phase 10C Python files>
+# 14 files already formatted.
+
+for phase10c_file in <the 14 Phase 10C Python files>; do
+  black --check --no-cache "$phase10c_file" || exit 1
+done
+# 14 individual checks passed; each file would be left unchanged.
+
+mypy backend
+# Success: no issues found in 133 source files.
+
+python -m compileall -q backend alembic
+# Exit 0 with no output.
+
+docker compose config --quiet
+# Exit 0 with no output.
+
+alembic heads
+# 7d3e1a9c5b20 (head)
+
+git diff --check
+# Exit 0 with no output.
+
+docker compose exec -T celery-worker \
+  celery -A app.workers.celery_app inspect registered --timeout 10
+# One worker online; both Phase 10C tasks registered.
+
+docker compose exec -T celery-beat python -c '<inspect default schedule>'
+# workflow_schedule_present=False.
+
+docker compose exec -T -e INTELLIGENCE_WORKFLOW_SCHEDULE_ENABLED=true \
+  -e INTELLIGENCE_WORKFLOW_SCHEDULE_INTERVAL_MINUTES=17 \
+  celery-beat python -c '<inspect enabled schedule>'
+# Only run-intelligence-workflow was present; schedule=1020 seconds.
+
+curl -fsS http://127.0.0.1:8000/api/v1/health
+# {"status":"ok"}
+```
+
+The real-service portable test did not mock indicator scoring, exact-CVE correlation, or event
+scoring. It ingested two reporting items through `FeedManager`, extracted their shared CVE, persisted
+one canonical CVE score, created one stable exact-CVE event, and persisted one event score. The
+workflow completed with enrichment explicitly recorded as skipped because that test disabled
+providers.
+
+### PostgreSQL isolation and development-database checks
+
+Only the existing ownership-validated fixture created `threatlens_phase6b_test`. No database was
+manually created, dropped, truncated, or cleaned. After the final full suite, the administrative
+exact-name query returned zero databases named `threatlens_phase6b_test`, proving fixture cleanup.
+
+Read-only development checks before implementation validation and after all tests/runtime recovery
+both observed exactly:
+
+```text
+current_database       = threatlens
+raw_articles           = 428
+indicators             = 2023
+article_indicators     = 65530
+indicator_enrichments  = 234
+epss_history           = 519
+correlated_events      = 0
+score_history          = 1
+workflow_table         = absent
+```
+
+The development data counts did not change, `intelligence_workflow_runs` was not migrated into the
+development database, and the coordinated schedule remained disabled.
+
+### Remaining work and final summary
+
+Phase 10C intentionally exposes workflow history through SQL, Celery results, and logs only. Phase 11
+should complete the analyst read API and may add bounded workflow-status visibility. Later operations
+work can add explicit retry/cancellation controls, metrics, alerts, retention, and an outbox if
+exactly-once successor publication becomes necessary.
+
+Summary: Phase 10C adds a durable default-off state machine that sequences ingestion/extraction,
+atomic bounded enrichment, indicator scoring, exact-CVE correlation, and event scoring; persists run
+identity, stage outcomes, cursors, skips, and failures; recovers missed continuations; and preserves
+all existing scoring/correlation semantics. Validation passed 87 focused portable tests, two focused
+PostgreSQL tests, 494 portable tests with 13 expected skips, and 507 tests with PostgreSQL. Both new
+tasks are registered in the running worker, Beat remains default-off for this workflow, API health is
+green, and the development database is unchanged. Phase 11 analyst API work remains unfinished.
+
+Phase 10C working diff: 19 files, 2071 additions, and 3 deletions. Nothing was staged or committed; unrelated personal, Graphify, Obsidian, and roadmap PDF files were preserved.

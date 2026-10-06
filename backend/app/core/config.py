@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     event_scoring_schedule_enabled: bool = False
     event_scoring_schedule_interval_minutes: int = Field(default=60, ge=1)
     event_scoring_page_limit: int = Field(default=100, ge=1, le=1000)
+    intelligence_workflow_schedule_enabled: bool = False
+    intelligence_workflow_schedule_interval_minutes: int = Field(default=60, ge=1)
+    intelligence_workflow_retry_delay_seconds: int = Field(default=30, ge=1, le=3600)
     enrichment_enabled: bool = False
     enrichment_ttl_seconds: int = Field(default=86400, ge=60)
     enrichment_request_timeout_seconds: float = Field(default=10.0, gt=0, le=120)

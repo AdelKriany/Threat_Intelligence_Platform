@@ -36,9 +36,11 @@ class EnrichmentService:
         *,
         registry: ProviderRegistry | None = None,
         ttl_seconds: int | None = None,
+        commit_results: bool = True,
     ) -> None:
         self.session = session
         self.registry = registry or ProviderRegistry.from_settings()
+        self.commit_results = commit_results
         self.ttl = timedelta(
             seconds=(
                 settings.enrichment_ttl_seconds if ttl_seconds is None else max(ttl_seconds, 0)
@@ -98,7 +100,10 @@ class EnrichmentService:
             upsert_result(self.session, result)
             upsert_epss_history(self.session, result)
             results.append(result)
-        self.session.commit()
+        if self.commit_results:
+            self.session.commit()
+        else:
+            self.session.flush()
         return results
 
     async def _call_provider(

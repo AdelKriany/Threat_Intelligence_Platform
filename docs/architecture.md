@@ -870,3 +870,58 @@ completed pages through the existing event and relationship uniqueness constrain
 
 Phase 10B never invokes indicator scoring, event scoring, enrichment, providers, network clients, or
 API handlers. Cross-stage sequencing and a durable pipeline coordinator remain Phase 10C work.
+
+## Phase 10C coordinated end-to-end intelligence workflow
+
+Phase 10C adds an opt-in durable coordinator around the existing ingestion, extraction, enrichment,
+indicator-scoring, exact-CVE correlation, and event-scoring boundaries. Formula v1, event scoring,
+exact-CVE correlation rules, provider adapters, and their persistence services remain authoritative
+and unchanged.
+
+```text
+Beat root
+  -> create or recover one active workflow run
+  -> ingestion (IOC extraction remains inside the existing ingestion path)
+  -> bounded enrichment pages
+  -> bounded indicator-score pages
+  -> bounded exact-CVE correlation pages
+  -> bounded event-score pages
+  -> completed
+```
+
+The `intelligence_workflow_runs` table is the durable control plane. Its UUID-shaped `run_id`,
+logical scoring timestamp, current stage, stage status, ascending-ID cursor, page-limit snapshot,
+per-stage JSON outcomes, error details, and timestamps make queued, running, skipped, completed, and
+failed work inspectable. A nullable unique `active_slot` permits any number of terminal records but
+only one active run. Concurrent roots either create that row or recover the winner; unrelated
+integrity failures are not treated as active-run conflicts.
+
+The coordinator is a state machine, not a new domain service. It calls the existing ingestion and
+enrichment entry points and the existing `backfill_indicator_scores`, `backfill_cve_correlations`,
+and `backfill_event_scores` services. Each scoring or correlation page updates its domain records,
+the durable cursor, and the stage outcome in one database transaction. The coordinated enrichment
+path disables `EnrichmentService`'s per-indicator commits and commits the bounded batch once; its
+checkpoint follows in a separate short transaction, so replay after a crash relies on the existing
+provider-result upserts. Ingestion retains its established per-article and indicator-persistence
+transactions; a crash before the workflow checkpoint safely replays through content-hash and
+canonical-indicator deduplication.
+
+Every successful page publishes its successor only after commit. If publication is interrupted,
+the next Beat root finds the still-active row and resumes at its persisted stage and cursor instead
+of beginning a second run. Redis locks serialize a run and reuse each standalone stage's lock, while
+the workflow active-slot constraint and existing domain uniqueness constraints remain authoritative
+when Redis fails open. Stage-lock contention is recorded as `skipped` and retried after the configured
+delay. An unexpected stage error rolls back the current transaction, records a terminal failure, and
+does not enqueue another page. A new periodic root can safely replay the idempotent pipeline in a new
+run.
+
+`INTELLIGENCE_WORKFLOW_SCHEDULE_ENABLED` defaults to `false`. When enabled, Beat installs only the
+coordinated root schedule; standalone ingestion, enrichment, indicator-scoring, correlation, and
+event-scoring schedules are intentionally omitted to avoid competing execution paths. The interval
+defaults to 60 minutes and lock-contention retries to 30 seconds. Existing enrichment and page-limit
+settings are snapshotted when a run is created.
+
+Phase 10C adds no API, CLI, formula, provider, correlation signal, fuzzy matching, dashboard,
+report, or notification behavior. Operational state is currently available through Celery results,
+logs, and read-only SQL against the workflow table. A later API phase may expose that state without
+moving orchestration logic into request handlers.

@@ -5,6 +5,8 @@ from datetime import timedelta
 
 from celery import shared_task
 
+from app.database.session import SessionLocal
+from app.ingestion.feed_manager import FeedManager
 from app.ingestion.registry import FeedRegistry
 from app.ingestion.services import IngestionService
 
@@ -15,10 +17,24 @@ logger = logging.getLogger(__name__)
 def run_ingestion_task(feed_name: str | None = None) -> dict[str, int]:
     """Execute the ingestion pipeline for one or all configured feeds."""
 
+    return run_ingestion(feed_name)
+
+
+def run_ingestion(
+    feed_name: str | None = None,
+    *,
+    dispatch_enrichment: bool = True,
+) -> dict[str, int]:
+    """Run existing ingestion, optionally leaving enrichment to a coordinator."""
+
     registry = FeedRegistry.from_settings()
-    service = IngestionService(registry=registry)
     if feed_name:
         registry._sources = [source for source in registry._sources if source.name == feed_name]
+    feed_manager = FeedManager(
+        session_factory=SessionLocal,
+        enrichment_dispatch_enabled=dispatch_enrichment,
+    )
+    service = IngestionService(registry=registry, feed_manager=feed_manager)
     return service.run_all()
 
 

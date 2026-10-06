@@ -19,6 +19,7 @@ def _load_runtime_settings() -> tuple[Any, Any]:
     from app.core.config import settings
     from app.database.base import Base
     from app.ingestion import models as ingestion_models  # noqa: F401
+    from app.models import intelligence_workflow as intelligence_workflow_models  # noqa: F401
     from app.models import phase6b as phase6b_models  # noqa: F401
 
     return settings, Base

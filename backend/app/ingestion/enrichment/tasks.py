@@ -184,6 +184,17 @@ def enrich_pending_batch_task(
 ) -> dict[str, int]:
     """Refresh a bounded pending/expired batch, optionally restricted to one provider."""
 
+    return enrich_pending_batch(batch_size=batch_size, provider_name=provider_name)
+
+
+def enrich_pending_batch(
+    batch_size: int | None = None,
+    provider_name: str | None = None,
+    *,
+    atomic: bool = False,
+) -> dict[str, int]:
+    """Execute the shared bounded batch, optionally committing the whole page atomically."""
+
     configured_limit = max(1, settings.enrichment_batch_size)
     limit = max(1, min(batch_size or configured_limit, configured_limit))
     lock_name = f"pending-{provider_name or 'all'}"
@@ -224,9 +235,15 @@ def enrich_pending_batch_task(
                 len(indicator_ids),
             )
             result_count = 0
-            service = EnrichmentService(session, registry=execution_registry)
+            service = EnrichmentService(
+                session,
+                registry=execution_registry,
+                commit_results=not atomic,
+            )
             for indicator_id in indicator_ids:
                 result_count += len(asyncio.run(service.enrich_indicator(indicator_id)))
+            if atomic:
+                session.commit()
             return {"indicators": len(indicator_ids), "results": result_count}
     finally:
         release_task_lock(lock_client, lock_name, token)

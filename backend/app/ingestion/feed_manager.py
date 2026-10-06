@@ -23,10 +23,13 @@ class FeedManager:
         session_factory: Any,
         ioc_extractor: IOCExtractionService | None = None,
         enrichment_dispatcher: Any | None = None,
+        *,
+        enrichment_dispatch_enabled: bool = True,
     ) -> None:
         self.session_factory = session_factory
         self.ioc_extractor = ioc_extractor or IOCExtractionService()
         self.enrichment_dispatcher = enrichment_dispatcher
+        self.enrichment_dispatch_enabled = enrichment_dispatch_enabled
 
     def store(self, article: NormalizedArticle) -> tuple[bool, int]:
         """Persist a normalized article if it is not a duplicate.
@@ -100,6 +103,8 @@ class FeedManager:
             return True, persisted_count
 
     def _should_dispatch_enrichment(self, session: Any, raw_article_id: int) -> bool:
+        if not self.enrichment_dispatch_enabled:
+            return False
         if self.enrichment_dispatcher is not None:
             return True
         if not settings.enrichment_enabled:
