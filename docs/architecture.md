@@ -798,3 +798,42 @@ The Celery worker and Beat continue to use Redis as broker/result backend with U
 The worker explicitly imports the new task module. Local Compose passes schedule settings only to
 Beat and mounts the backend source into both worker and Beat, ensuring both processes load the same
 task contract.
+
+## Phase 10A bounded and scheduled indicator scoring
+
+Phase 10A adds a synchronous bounded page service and an opt-in Celery workflow around the existing
+Formula v1 indicator-scoring boundary. It does not modify the formula, provider mapping, canonical
+evidence snapshot, score persistence, database schema, enrichment, correlation, or event scoring.
+
+```text
+backfill_indicator_scores(session, *, apply, limit=100, after_id=0, as_of)
+    -> IndicatorScoreBackfillResult
+```
+
+Candidates are all canonical indicators selected by `id > after_id`, ordered by ascending ID, and
+capped by `limit` from 1 through 1000. One additional ID determines `has_more`; `next_after_id` is
+returned only when another page exists. The structured result contains ordered item outcomes,
+cursor metadata, missing and unscorable counts, and create/reuse forecasts and applied counts.
+
+Dry-run is the CLI default. Every candidate uses `calculate_and_persist_indicator_score`; a
+rollback-only savepoint provides exact create/reuse forecasting without durable score or component
+writes. Apply mode leaves the entire page in the caller's transaction. The CLI commits once after a
+successful page and rolls the whole page back on unexpected failure. A concurrently removed
+candidate is reported as `missing`, invalid stored scoring evidence is `unscorable`, and unexpected
+errors propagate.
+
+When an indicator already has a score, the backfill reuses its latest persisted calculation time as
+the scoring context. Unchanged evidence therefore resolves to the existing
+indicator/formula/evidence-hash row during later runs; changed canonical evidence appends history.
+The existing narrowly scoped uniqueness-conflict handling remains authoritative under concurrent
+workers.
+
+The Celery task owns one session and one bounded-page transaction. It acquires the global
+`indicator-scoring-backfill` Redis lock, calls the service in apply mode, commits once, releases the
+lock, and then publishes one successor with the next cursor and the root sweep's stable UTC
+timestamp. Failure rolls back, releases the lock, propagates to Celery, and never continues.
+
+Scheduling is disabled by default and requires `INDICATOR_SCORING_SCHEDULE_ENABLED=true`. The
+interval defaults to 60 minutes and page size to 100. A crash after commit but before successor
+publication is recovered by the next periodic root because completed pages are idempotent. No
+outbox or workflow table is introduced in this phase.

@@ -15,6 +15,7 @@ celery_app.conf.update(
     enable_utc=True,
     imports=(
         "app.ingestion.enrichment.tasks",
+        "app.workers.indicator_scoring_tasks",
         "app.workers.event_scoring_tasks",
     ),
 )
@@ -28,6 +29,15 @@ def configure_beat_schedule() -> None:
     from app.ingestion.scheduler import build_beat_schedule
 
     celery_app.conf.beat_schedule = build_beat_schedule()
+    if settings.indicator_scoring_schedule_enabled:
+        celery_app.conf.beat_schedule["score-canonical-indicators"] = {
+            "task": "app.workers.indicator_scoring_tasks.score_indicator_page_task",
+            "schedule": settings.indicator_scoring_schedule_interval_minutes * 60,
+            "kwargs": {
+                "limit": settings.indicator_scoring_page_limit,
+                "after_id": 0,
+            },
+        }
     if settings.event_scoring_schedule_enabled:
         celery_app.conf.beat_schedule["score-exact-cve-events"] = {
             "task": "app.workers.event_scoring_tasks.score_event_page_task",

@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://threatlens:threatlens@localhost:5432/threatlens"
     redis_url: str = "redis://localhost:6379/0"
     log_level: str = "INFO"
+    indicator_scoring_schedule_enabled: bool = False
+    indicator_scoring_schedule_interval_minutes: int = Field(default=60, ge=1)
+    indicator_scoring_page_limit: int = Field(default=100, ge=1, le=1000)
     event_scoring_schedule_enabled: bool = False
     event_scoring_schedule_interval_minutes: int = Field(default=60, ge=1)
     event_scoring_page_limit: int = Field(default=100, ge=1, le=1000)

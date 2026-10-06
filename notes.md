@@ -2602,3 +2602,166 @@ PostgreSQL skips portably and 473 tests with PostgreSQL. No schema or scoring se
 
 Phase 9D working diff: 8 files, 602 additions, and 1 deletion. Nothing was staged or committed;
 pre-existing untracked Graphify/Obsidian workspace files were preserved and are not part of Phase 9D.
+
+## Phase 10A - Bounded Indicator-Scoring Backfill and Scheduling - 2026-10-07
+
+### What was implemented and why
+
+Phase 10A closes the gap between stored enrichment evidence and persisted Formula v1 indicator
+scores. It adds a synchronous bounded dry-run/apply service and command, plus an opt-in Celery task
+and Beat schedule. The implementation reuses `calculate_and_persist_indicator_score`; no scoring
+formula, evidence mapping, canonical hashing, persistence semantics, model, or migration changed.
+
+### Files and purpose
+
+- `backend/app/services/indicator_scoring_backfill.py`: page selection, forecasting/apply result,
+  savepoint dry-run, caller-owned transaction, and CLI.
+- `backend/app/workers/indicator_scoring_tasks.py`: Redis-serialized one-page Celery execution and
+  post-commit continuation.
+- `backend/app/core/config.py`: disabled-by-default schedule, interval, and page-size settings.
+- `backend/app/workers/celery_app.py`: task import and optional Beat root.
+- `docker-compose.yml`: passes the three schedule settings to Beat.
+- `backend/tests/test_indicator_scoring_backfill.py`: portable page, cursor, idempotency, rollback,
+  classification, CLI, and scope tests.
+- `backend/tests/test_indicator_scoring_tasks.py`: transaction ordering, continuation, lock, input,
+  registration, and opt-in scheduling tests.
+- `backend/tests/test_indicator_scoring_backfill_postgres.py`: protected dry-run and concurrent
+  create/reuse test with unrelated caller work.
+- `docs/architecture.md`: Phase 10A service and runtime transaction contract.
+- `Phase10A_Indicator_Scoring_Backfill_and_Scheduling.md`: implementation and operator guide.
+- `notes.md`: this append-only observed record.
+
+### Interface and behavior
+
+```text
+backfill_indicator_scores(session, *, apply, limit=100, after_id=0, as_of)
+    -> IndicatorScoreBackfillResult
+```
+
+Indicators are scanned by ascending ID with a 1-1000 limit. The service reads one extra ID only to
+determine `has_more`. Dry-run is the CLI default and invokes the authoritative persistence service
+inside a rollback-only savepoint. Apply leaves the page in the caller's transaction; the CLI or
+Celery task commits once after every candidate succeeds. Results distinguish scoreable, missing,
+and unscorable candidates and report exact create/reuse forecasts and applied counts.
+
+Existing indicators reuse their latest persisted calculation context, so unchanged evidence reuses
+the canonical indicator/formula/evidence-hash row while changed evidence appends history. The task
+uses the `indicator-scoring-backfill` Redis lock, commits one page, releases the lock, and publishes
+the next cursor afterward with the sweep's stable UTC timestamp.
+
+Configuration defaults are:
+
+```text
+INDICATOR_SCORING_SCHEDULE_ENABLED=false
+INDICATOR_SCORING_SCHEDULE_INTERVAL_MINUTES=60
+INDICATOR_SCORING_PAGE_LIMIT=100
+```
+
+### Design decisions and boundaries
+
+1. All canonical IOC types are candidates because Formula v1 defines normal source/evidence behavior
+   for every stored `IOCType`, including types with no applicable provider.
+2. The service delegates all scoring, snapshot, hash, component, and uniqueness behavior to the
+   existing Phase 6B orchestration.
+3. Scheduling is disabled by default because it performs apply-mode database writes.
+4. One task equals one page and one transaction. The task never calls the CLI error-code boundary.
+5. Phase 10A never runs enrichment, correlation, event scoring, provider clients, or network calls.
+6. No outbox or workflow table was added. A later root safely recovers a commit-to-enqueue crash.
+
+### Problems encountered and resolutions
+
+1. The first two protected PostgreSQL attempts could not connect to localhost from the sandbox even
+   though Compose reported PostgreSQL healthy. Running the same ownership-validated fixture with
+   approved localhost access passed; no manual database creation, deletion, or cleanup was used.
+2. The first full PostgreSQL suite run produced 489 passes and one failure in the pre-existing
+   concurrent event-score API test: one request transiently returned 404 and broke its barrier. The
+   test passed alone immediately afterward, and a clean complete rerun passed all 490 tests. No
+   unrelated production or test code was changed for the transient result.
+3. Black's default worker pool was blocked by sandbox process permissions. The documented
+   single-worker invocation completed successfully with exit zero.
+
+### Exact verification commands and observed results
+
+```bash
+pytest -q backend/tests/test_indicator_scoring_backfill.py \
+  backend/tests/test_indicator_scoring_tasks.py
+# 16 passed in 0.93s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q backend/tests/test_indicator_scoring_backfill_postgres.py
+# 1 passed in 2.62s
+
+pytest -q
+# 479 passed, 11 skipped in 10.09s
+
+PHASE6B_POSTGRES_URL='postgresql+psycopg://threatlens:threatlens@127.0.0.1:5433/threatlens_phase6b_test' \
+  pytest -q
+# First run: 489 passed, 1 failed in 25.87s (pre-existing concurrent API test).
+# Isolated failed test rerun: 1 passed in 1.49s.
+# Clean full rerun: 490 passed in 15.45s.
+
+ruff check .
+# All checks passed.
+
+ruff format --check backend/app/services/indicator_scoring_backfill.py \
+  backend/app/workers/indicator_scoring_tasks.py backend/app/core/config.py \
+  backend/app/workers/celery_app.py backend/tests/test_indicator_scoring_backfill.py \
+  backend/tests/test_indicator_scoring_tasks.py \
+  backend/tests/test_indicator_scoring_backfill_postgres.py
+# 7 files already formatted.
+
+black --check --no-cache --workers 1 <the same seven Python files>
+# Exit 0 with no output.
+
+mypy backend
+# Success: no issues found in 126 source files.
+
+python -m compileall -q backend
+# Exit 0 with no output.
+
+docker compose config --quiet
+# Exit 0 with no output.
+
+git diff --check
+# Exit 0 with no output.
+
+docker compose exec -T celery-worker \
+  celery -A app.workers.celery_app inspect registered --timeout 10
+# One worker online; score_indicator_page_task registered.
+
+docker compose exec -T celery-beat python -c '<inspect default schedule>'
+# score-canonical-indicators present=False.
+
+docker compose exec -T -e INDICATOR_SCORING_SCHEDULE_ENABLED=true \
+  -e INDICATOR_SCORING_SCHEDULE_INTERVAL_MINUTES=15 \
+  -e INDICATOR_SCORING_PAGE_LIMIT=40 celery-beat python -c '<inspect enabled schedule>'
+# task=score_indicator_page_task, schedule=900, kwargs={limit: 40, after_id: 0}.
+```
+
+### PostgreSQL isolation and development database observation
+
+Only the ownership-validated fixture created and deleted `threatlens_phase6b_test`. After the final
+suite, an administrative exact-name query returned zero matching databases. No manual create, drop,
+truncate, schema cleanup, or volume operation was used.
+
+A read-only transaction observed development database `threatlens` with 428 raw articles, 2023
+indicators, 65530 article-indicator links, 234 indicator enrichments, 519 EPSS rows, and one
+score-history row, then rolled back. No before-count was captured in this increment, so these values
+are final observations rather than an unchanged-count claim. The default-disabled Phase 10A
+schedule did not score development indicators.
+
+### Remaining work and summary
+
+Phase 10A intentionally does not schedule exact-CVE correlation or coordinate the complete pipeline.
+Phase 10B should wrap the existing bounded correlation backfill with the same opt-in, one-page
+atomic pattern. Phase 10C can then coordinate ingestion, enrichment, indicator scoring, correlation,
+and event scoring without merging their transaction boundaries.
+
+Summary: Phase 10A adds bounded indicator-score forecasting/apply, ascending cursor pagination,
+unchanged-evidence reuse, one-page Celery transactions, post-commit continuation, default-off Beat
+scheduling, protected concurrency coverage, and operator documentation. Final validation passed 16
+focused portable tests, one focused PostgreSQL test, 479 portable tests with 11 skips, and 490 tests
+with PostgreSQL. No schema or scoring semantics changed; Phase 10B correlation scheduling remains.
+
+Phase 10A working diff: 11 files and 1472 additions. Nothing was staged or committed; unrelated
+untracked Graphify, Obsidian, personal workspace, and `future_plan.pdf` files were preserved.
